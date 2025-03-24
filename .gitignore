@@ -1,2 +1,6 @@
-minimal-scheduler/*
-.vscode/*
+*.o
+*linux-*
+*vmlinux.h
+*-log
+*.gz
+*.dsc
