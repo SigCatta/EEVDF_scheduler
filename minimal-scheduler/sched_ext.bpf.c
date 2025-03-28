@@ -13,13 +13,6 @@
     SEC("struct_ops.s/"#name)							      \
     BPF_PROG(name, ##args)
 
-// We use the new names from 6.13 to make it more readable
-#define scx_bpf_dsq_insert scx_bpf_dispatch
-#define scx_bpf_dsq_insert_vtime scx_bpf_dispatch_vtime
-#define scx_bpf_dsq_move_to_local scx_bpf_consume
-#define scx_bpf_dsq_move scx_bpf_dispatch_from_dsq
-#define scx_bpf_dsq_move_vtime scx_bpf_dispatch_vtime_from_dsq
-
 // Define a BPF map to store virtual deadlines for tasks
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -47,17 +40,36 @@ int BPF_STRUCT_OPS(sched_enqueue, struct task_struct *p, u64 enq_flags) {
 
     // Store the virtual deadline in the BPF map
     bpf_map_update_elem(&task_deadlines, &pid, &deadline, BPF_ANY);
+    
+    // Calculate a time slice for the task
+    u64 time_slice = 5000000; // fixed time slice of 5ms (in nanoseconds)
 
     // Enqueue the task with its virtual deadline
-    scx_bpf_dsq_insert(p, SHARED_DSQ_ID, deadline, enq_flags);
+    scx_bpf_dsq_insert_vtime(p, SHARED_DSQ_ID, time_slice, deadline, enq_flags);
     return 0;
 }
 
-// Dispatch a task from the shared DSQ to a CPU
 int BPF_STRUCT_OPS(sched_dispatch, s32 cpu, struct task_struct *prev) {
-    // Dispatch the task with the earliest virtual deadline
-    scx_bpf_dsq_move_to_local(SHARED_DSQ_ID);
-    return 0;
+    struct bpf_iter_scx_dsq it__iter; // DSQ iterator
+    struct task_struct *p = NULL;     // Pointer to the task being dispatched
+
+    bpf_iter_scx_dsq_new(&it__iter, SHARED_DSQ_ID, 0); // Initialize the DSQ iterator
+
+    p = bpf_iter_scx_dsq_next(&it__iter); // Get the next task from the DSQ
+
+    if(p == NULL) {
+        bpf_iter_scx_dsq_destroy(&it__iter); // Destroy the DSQ iterator
+        return -1; // No task was dispatched (e.g., DSQ is empty)
+    }
+
+    // Attempt to dispatch the task with the earliest virtual deadline
+    if (scx_bpf_dsq_move_vtime(&it__iter, p, SHARED_DSQ_ID, 0) == 0) {
+        bpf_iter_scx_dsq_destroy(&it__iter); // Destroy the DSQ iterator
+        return 0; // Task successfully dispatched
+    }
+
+    bpf_iter_scx_dsq_destroy(&it__iter); // Destroy the DSQ iterator
+    return -1; // No task was dispatched (e.g., DSQ is empty)
 }
 
 // Define the main scheduler operations structure (sched_ops)
