@@ -49,6 +49,34 @@ int BPF_STRUCT_OPS(sched_enqueue, struct task_struct *p, u64 enq_flags) {
     return 0;
 }
 
+static bool is_task_eligible(struct task_struct *p, s32 cpu) {
+    // Skip tasks that are not in TASK_RUNNING state
+    if (p->__state != 0) {
+        bpf_printk("Skipping task %d: not in TASK_RUNNING state (state=%ld)\n", p->pid, p->__state);
+        return false;
+    }
+
+    // Skip idle tasks
+    if (p->pid == 0) {
+        bpf_printk("Skipping idle task on CPU %d\n", cpu);
+        return false;
+    }
+
+    // Check if the task can be moved (on_cpu is basically a lock...)
+    if (p->on_cpu != 0) {
+        bpf_printk("Task %d cannot be moved on CPU %d\n", p->pid, cpu);
+        return false;
+    }
+
+    // Check if the task's CPU affinity allows it to run on the specified CPU
+    if (!(p->cpus_mask.bits[0] & (1 << cpu))) {
+        bpf_printk("Task %d cannot run on CPU %d due to affinity\n", p->pid, cpu);
+        return false;
+    }
+
+    return true; // Task is eligible for dispatch
+}
+
 int BPF_STRUCT_OPS(sched_dispatch, s32 cpu, struct task_struct *prev) {
     struct bpf_iter_scx_dsq it__iter; // DSQ iterator
     struct task_struct *p = NULL;     // Pointer to the task being dispatched
@@ -59,36 +87,12 @@ int BPF_STRUCT_OPS(sched_dispatch, s32 cpu, struct task_struct *prev) {
         return -1;
     }
     
-    
-    do { // Loop to find a task to dispatch
-        p = bpf_iter_scx_dsq_next(&it__iter); // Get the next task from the DSQ
+    // Loop to find a task to dispatch
+    while ((p = bpf_iter_scx_dsq_next(&it__iter)) != NULL) {
 
-        if (p == NULL) {
-            bpf_printk("No task available in DSQ for CPU %d\n", cpu);
-            break;
-        }
-
-        // Skip tasks that are not in TASK_RUNNING state
-        if (p->__state != 0) {
-            bpf_printk("Skipping task %d: not in TASK_RUNNING state (state=%ld)\n", p->pid, p->__state);
-            continue;
-        }
-
-        // Skip idle tasks
-        if (p->pid == 0) {
-            bpf_printk("Skipping idle task on CPU %d\n", cpu);
-            continue;
-        }
-
-        if (p->on_cpu != 0) {
-            bpf_printk("Task %d cannot be moved on CPU %d\n", p->pid, cpu);
-            continue;
-        }
-
-        // Check if the task's CPU affinity allows it to run on the specified CPU
-        if (!(p->cpus_mask.bits[0] & (1 << cpu))) {
-            bpf_printk("Task %d cannot run on CPU %d due to affinity\n", p->pid, cpu);
-            continue;
+        if(!is_task_eligible(p, cpu)) {
+            bpf_printk("Task %d is not eligible for dispatch on CPU %d\n", p->pid, cpu);
+            continue; // Skip to the next task if not eligible
         }
 
         // Task is eligible for dispatch
@@ -103,8 +107,9 @@ int BPF_STRUCT_OPS(sched_dispatch, s32 cpu, struct task_struct *prev) {
         } else {
             bpf_printk("Failed to move task %d to CPU %d\n", p->pid, cpu);
         }
-    } while (p != NULL);
-
+    }
+    
+    bpf_printk("No task available in DSQ for CPU %d\n", cpu);
     bpf_iter_scx_dsq_destroy(&it__iter); // Destroy the DSQ iterator
     return -1; // No task was dispatched
 }
