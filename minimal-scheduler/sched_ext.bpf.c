@@ -5,6 +5,7 @@
 
 // Define a shared Dispatch Queue (DSQ) ID
 #define SHARED_DSQ_ID 0
+#define DEBUG 0
 
 #define BPF_STRUCT_OPS(name, args...)	\
     SEC("struct_ops/"#name)	BPF_PROG(name, ##args)
@@ -33,6 +34,37 @@ static __always_inline u64 calculate_virtual_deadline(struct task_struct *p) {
 // Initialize the scheduler by creating a shared dispatch queue (DSQ)
 s32 BPF_STRUCT_OPS_SLEEPABLE(sched_init) {
     return scx_bpf_create_dsq(SHARED_DSQ_ID, -1);
+}
+
+static __always_inline void print_tasks() {
+    struct task_struct *p = NULL;
+    struct bpf_iter_scx_dsq it__iter; // DSQ iterator
+
+    // Initialize the DSQ iterator
+    if (bpf_iter_scx_dsq_new(&it__iter, SHARED_DSQ_ID, 0) < 0) {
+        bpf_iter_scx_dsq_destroy(&it__iter);
+        return;
+    }
+
+    // Loop through tasks in the DSQ
+    int i = 1;
+    while ((p = bpf_iter_scx_dsq_next(&it__iter)) != NULL) {
+        u32 pid;
+        u64 *deadline;
+
+        // Copy the PID from the task_struct to a local variable
+        bpf_core_read(&pid, sizeof(pid), &p->pid);
+
+        // Get the virtual deadline from the BPF map
+        deadline = bpf_map_lookup_elem(&task_deadlines, &pid);
+        if (deadline) {
+            bpf_printk("%d. Task: %d, vdeadline: %llu\n", i++, pid, *deadline);
+        } else {
+            bpf_printk("%d. Task: %d, no deadline found\n", i++, pid);
+        }
+    }
+
+    bpf_iter_scx_dsq_destroy(&it__iter); // Destroy the DSQ iterator
 }
 
 // Enqueue a task to the shared DSQ, dispatching it with a virtual deadline
@@ -89,7 +121,11 @@ int BPF_STRUCT_OPS(sched_dispatch, s32 cpu, struct task_struct *prev) {
         bpf_iter_scx_dsq_destroy(&it__iter);
         return -1;
     }
-    
+
+    #if DEBUG == 1
+    print_tasks(); // Print the tasks in the DSQ for debugging
+    # endif    
+
     // Loop to find a task to dispatch
     while ((p = bpf_iter_scx_dsq_next(&it__iter)) != NULL) {
 
