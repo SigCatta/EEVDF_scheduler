@@ -13,6 +13,8 @@
     SEC("struct_ops.s/"#name)							      \
     BPF_PROG(name, ##args)
 
+#define MAX_TASK_MOVE_ATTEMPTS 3
+
 // Define a BPF map to store virtual deadlines for tasks
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -81,7 +83,8 @@ int BPF_STRUCT_OPS(sched_dispatch, s32 cpu, struct task_struct *prev) {
     struct bpf_iter_scx_dsq it__iter; // DSQ iterator
     struct task_struct *p = NULL;     // Pointer to the task being dispatched
 
-    if (bpf_iter_scx_dsq_new(&it__iter, SHARED_DSQ_ID, 0) < 0){  // Initialize the DSQ iterator
+    // Initialize the DSQ iterator
+    if (bpf_iter_scx_dsq_new(&it__iter, SHARED_DSQ_ID, 0) < 0){
         bpf_printk("Failed to initialize DSQ iterator for CPU %d\n", cpu);  
         bpf_iter_scx_dsq_destroy(&it__iter);
         return -1;
@@ -90,26 +93,26 @@ int BPF_STRUCT_OPS(sched_dispatch, s32 cpu, struct task_struct *prev) {
     // Loop to find a task to dispatch
     while ((p = bpf_iter_scx_dsq_next(&it__iter)) != NULL) {
 
-        if(!is_task_eligible(p, cpu)) {
-            bpf_printk("Task %d is not eligible for dispatch on CPU %d\n", p->pid, cpu);
-            continue; // Skip to the next task if not eligible
-        }
-
-        // Task is eligible for dispatch
-        bpf_printk("Dispatching task %d to CPU %d\n", p->pid, cpu);
-        bpf_printk("Task state: pid=%d, runtime=%llu, state=%ld\n", p->pid, p->se.sum_exec_runtime, p->__state);
+        // Skip to the next task if not eligible
+        if(!is_task_eligible(p, cpu)) continue;
 
         // Attempt to move the task
-        if (scx_bpf_dsq_move_vtime(&it__iter, p, SCX_DSQ_LOCAL, 0) == 0) {
-            bpf_printk("Successfully dispatched task %d to CPU %d\n", p->pid, cpu);
-            bpf_iter_scx_dsq_destroy(&it__iter); // Destroy the DSQ iterator
-            return 0; // Task successfully dispatched
-        } else {
-            bpf_printk("Failed to move task %d to CPU %d\n", p->pid, cpu);
+        int attempts = MAX_TASK_MOVE_ATTEMPTS;
+        while(attempts--){
+            bpf_printk("ATTEMPT: %d, task %d to CPU %d, additional info: on_cpu=%d, cpus_mask=%lx, state=%ld\n",
+                MAX_TASK_MOVE_ATTEMPTS - attempts, p->pid, cpu, p->on_cpu, p->cpus_mask.bits[0], p->__state);
+
+            if (scx_bpf_dsq_move_vtime(&it__iter, p, SCX_DSQ_LOCAL, 0) == 0) {
+                bpf_printk("Successfully dispatched task %d to CPU %d\n", p->pid, cpu);
+                bpf_iter_scx_dsq_destroy(&it__iter); // Destroy the DSQ iterator
+                return 0; // Task successfully dispatched
+            }
         }
+        bpf_printk("Failed to move task %d to CPU %d, additional info: on_cpu=%d, cpus_mask=%lx, state=%ld\n",
+            p->pid, cpu, p->on_cpu, p->cpus_mask.bits[0], p->__state, attempts);
     }
     
-    bpf_printk("No task available in DSQ for CPU %d\n", cpu);
+    // bpf_printk("No task available in DSQ for CPU %d\n", cpu);
     bpf_iter_scx_dsq_destroy(&it__iter); // Destroy the DSQ iterator
     return -1; // No task was dispatched
 }
