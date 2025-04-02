@@ -51,7 +51,7 @@ int BPF_STRUCT_OPS(sched_enqueue, struct task_struct *p, u64 enq_flags) {
     return 0;
 }
 
-static bool is_task_eligible(struct task_struct *p, s32 cpu) {
+static __always_inline bool is_task_eligible(struct task_struct *p, s32 cpu) {
     // Skip tasks that are not in TASK_RUNNING state
     if (p->__state != 0) {
         bpf_printk("Skipping task %d: not in TASK_RUNNING state (state=%ld)\n", p->pid, p->__state);
