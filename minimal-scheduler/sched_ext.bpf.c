@@ -5,7 +5,6 @@
 
 // Define a shared Dispatch Queue (DSQ) ID
 #define SHARED_DSQ_ID 0
-#define DEBUG 0
 
 #define BPF_STRUCT_OPS(name, args...)	\
     SEC("struct_ops/"#name)	BPF_PROG(name, ##args)
@@ -24,6 +23,18 @@ struct {
     __uint(max_entries, 1024);
 } task_deadlines SEC(".maps");
 
+// returns the a task's virtual deadline
+static __always_inline u64 get_task_deadline(struct task_struct *p) {
+    u32 pid;
+
+    // Copy the PID from the task_struct to a local variable ~ must do because of the BPF verifier
+    bpf_core_read(&pid, sizeof(pid), &p->pid);
+
+    // Perform the map lookup
+    u64 *deadline_ptr = bpf_map_lookup_elem(&task_deadlines, &pid);
+    return deadline_ptr ? *deadline_ptr : -1;
+}
+
 // Function to calculate the virtual deadline for a task
 static __always_inline u64 calculate_virtual_deadline(struct task_struct *p) {
     u64 now = bpf_ktime_get_ns(); // Current time in nanoseconds
@@ -31,11 +42,7 @@ static __always_inline u64 calculate_virtual_deadline(struct task_struct *p) {
     return now + runtime; // Example: deadline = now + runtime
 }
 
-// Initialize the scheduler by creating a shared dispatch queue (DSQ)
-s32 BPF_STRUCT_OPS_SLEEPABLE(sched_init) {
-    return scx_bpf_create_dsq(SHARED_DSQ_ID, -1);
-}
-
+// print the tasks in the shared DSQ, including their PIDs and virtual deadlines
 static __always_inline void print_tasks() {
     struct task_struct *p = NULL;
     struct bpf_iter_scx_dsq it__iter; // DSQ iterator
@@ -67,6 +74,11 @@ static __always_inline void print_tasks() {
     bpf_iter_scx_dsq_destroy(&it__iter); // Destroy the DSQ iterator
 }
 
+// Initialize the scheduler by creating a shared dispatch queue (DSQ)
+s32 BPF_STRUCT_OPS_SLEEPABLE(sched_init) {
+    return scx_bpf_create_dsq(SHARED_DSQ_ID, -1);
+}
+
 // Enqueue a task to the shared DSQ, dispatching it with a virtual deadline
 int BPF_STRUCT_OPS(sched_enqueue, struct task_struct *p, u64 enq_flags) {
     u32 pid = p->pid;
@@ -83,6 +95,7 @@ int BPF_STRUCT_OPS(sched_enqueue, struct task_struct *p, u64 enq_flags) {
     return 0;
 }
 
+// Check if a task is eligible for dispatch
 static __always_inline bool is_task_eligible(struct task_struct *p, s32 cpu) {
     // Skip tasks that are not in TASK_RUNNING state
     if (p->__state != 0) {
