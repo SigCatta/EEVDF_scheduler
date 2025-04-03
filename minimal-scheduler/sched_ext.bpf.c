@@ -114,17 +114,13 @@ static __always_inline bool is_task_eligible(struct task_struct *p, s32 cpu) {
 int BPF_STRUCT_OPS(sched_dispatch, s32 cpu, struct task_struct *prev) {
     struct bpf_iter_scx_dsq it__iter; // DSQ iterator
     struct task_struct *p = NULL;     // Pointer to the task being dispatched
+    int dispatched = -1;
 
     // Initialize the DSQ iterator
     if (bpf_iter_scx_dsq_new(&it__iter, SHARED_DSQ_ID, 0) < 0){
         bpf_printk("Failed to initialize DSQ iterator for CPU %d\n", cpu);  
-        bpf_iter_scx_dsq_destroy(&it__iter);
-        return -1;
+        goto out;
     }
-
-    #if DEBUG == 1
-    print_tasks(); // Print the tasks in the DSQ for debugging
-    # endif    
 
     // Loop to find a task to dispatch
     while ((p = bpf_iter_scx_dsq_next(&it__iter)) != NULL) {
@@ -138,19 +134,18 @@ int BPF_STRUCT_OPS(sched_dispatch, s32 cpu, struct task_struct *prev) {
             bpf_printk("ATTEMPT: %d, task %d to CPU %d, additional info: on_cpu=%d, cpus_mask=%lx, state=%ld\n",
                 MAX_TASK_MOVE_ATTEMPTS - attempts, p->pid, cpu, p->on_cpu, p->cpus_mask.bits[0], p->__state);
 
-            if (scx_bpf_dsq_move_vtime(&it__iter, p, SCX_DSQ_LOCAL, 0) == 0) {
+            if ((dispatched = scx_bpf_dsq_move_vtime(&it__iter, p, SCX_DSQ_LOCAL, 0)) == 0) {
                 bpf_printk("Successfully dispatched task %d to CPU %d\n", p->pid, cpu);
-                bpf_iter_scx_dsq_destroy(&it__iter); // Destroy the DSQ iterator
-                return 0; // Task successfully dispatched
+                goto out;
             }
         }
         bpf_printk("Failed to move task %d to CPU %d, additional info: on_cpu=%d, cpus_mask=%lx, state=%ld\n",
             p->pid, cpu, p->on_cpu, p->cpus_mask.bits[0], p->__state, attempts);
     }
     
-    // bpf_printk("No task available in DSQ for CPU %d\n", cpu);
+out:
     bpf_iter_scx_dsq_destroy(&it__iter); // Destroy the DSQ iterator
-    return -1; // No task was dispatched
+    return dispatched; // No task was dispatched
 }
 
 // Define the main scheduler operations structure (sched_ops)
