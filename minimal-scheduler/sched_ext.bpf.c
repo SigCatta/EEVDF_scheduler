@@ -144,7 +144,7 @@ int BPF_STRUCT_OPS(sched_dispatch, s32 cpu, struct task_struct *prev) {
         if(!is_task_eligible(p, cpu)) continue;
 
         // Attempt to move the task
-        if ((dispatched = scx_bpf_dsq_move_vtime(&it__iter, p, SCX_DSQ_LOCAL, 0))) {
+        if ((dispatched = scx_bpf_dsq_move(&it__iter, p, SCX_DSQ_LOCAL, 0))) {
             bpf_printk("Successfully dispatched task %d to CPU %d\n", p->pid, cpu);
             goto out;
         }
