@@ -13,8 +13,6 @@
     SEC("struct_ops.s/"#name)							      \
     BPF_PROG(name, ##args)
 
-#define MAX_TASK_MOVE_ATTEMPTS 3
-
 // Define a BPF map to store virtual deadlines for tasks
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -124,13 +122,17 @@ static __always_inline bool is_task_eligible(struct task_struct *p, s32 cpu) {
     return true; // Task is eligible for dispatch
 }
 
+/**
+ * Dispatch a task from the user-defined global DSQ (user-defined as a priority queue on vdeadline) to the local cpu
+ * Returns 1 if successful, 0 if no task was dispatched, negative error codes on failure
+ */
 int BPF_STRUCT_OPS(sched_dispatch, s32 cpu, struct task_struct *prev) {
     struct bpf_iter_scx_dsq it__iter; // DSQ iterator
     struct task_struct *p = NULL;     // Pointer to the task being dispatched
-    int dispatched = -1;
+    int dispatched;                   // return value
 
     // Initialize the DSQ iterator
-    if (bpf_iter_scx_dsq_new(&it__iter, SHARED_DSQ_ID, 0) < 0){
+    if ((dispatched = bpf_iter_scx_dsq_new(&it__iter, SHARED_DSQ_ID, 0)) < 0){
         bpf_printk("Failed to initialize DSQ iterator for CPU %d\n", cpu);  
         goto out;
     }
@@ -142,18 +144,11 @@ int BPF_STRUCT_OPS(sched_dispatch, s32 cpu, struct task_struct *prev) {
         if(!is_task_eligible(p, cpu)) continue;
 
         // Attempt to move the task
-        int attempts = MAX_TASK_MOVE_ATTEMPTS;
-        while(attempts--){
-            bpf_printk("ATTEMPT: %d, task %d to CPU %d, additional info: on_cpu=%d, cpus_mask=%lx, state=%ld\n",
-                MAX_TASK_MOVE_ATTEMPTS - attempts, p->pid, cpu, p->on_cpu, p->cpus_mask.bits[0], p->__state);
-
-            if ((dispatched = scx_bpf_dsq_move_vtime(&it__iter, p, SCX_DSQ_LOCAL, 0)) == 0) {
-                bpf_printk("Successfully dispatched task %d to CPU %d\n", p->pid, cpu);
-                goto out;
-            }
+        if ((dispatched = scx_bpf_dsq_move_vtime(&it__iter, p, SCX_DSQ_LOCAL, 0))) {
+            bpf_printk("Successfully dispatched task %d to CPU %d\n", p->pid, cpu);
+            goto out;
         }
-        bpf_printk("Failed to move task %d to CPU %d, additional info: on_cpu=%d, cpus_mask=%lx, state=%ld\n",
-            p->pid, cpu, p->on_cpu, p->cpus_mask.bits[0], p->__state, attempts);
+        else bpf_printk("Failed to move task %d to CPU %d\n", p->pid, cpu);
     }
     
 out:
