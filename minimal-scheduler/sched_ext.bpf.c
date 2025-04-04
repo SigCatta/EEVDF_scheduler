@@ -132,13 +132,13 @@ int BPF_STRUCT_OPS(sched_dispatch, s32 cpu, struct task_struct *prev) {
     int dispatched;                   // return value
 
     // Initialize the DSQ iterator
-    if ((dispatched = bpf_iter_scx_dsq_new(&it__iter, SHARED_DSQ_ID, 0)) < 0){
+    if ((dispatched = bpf_iter_scx_dsq_new(&it__iter, SHARED_DSQ_ID, 0))){
         bpf_printk("Failed to initialize DSQ iterator for CPU %d\n", cpu);  
         goto out;
     }
 
     // Loop to find a task to dispatch
-    while ((p = bpf_iter_scx_dsq_next(&it__iter)) != NULL) {
+    while ((p = bpf_iter_scx_dsq_next(&it__iter))) {
 
         // Skip to the next task if not eligible
         if(!is_task_eligible(p, cpu)) continue;
