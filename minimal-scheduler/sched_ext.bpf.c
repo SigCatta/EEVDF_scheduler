@@ -3,6 +3,12 @@
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
 
+#define bpf_obj_new(type) ((type *)bpf_obj_new_impl(bpf_core_type_id_local(type), NULL))
+#define bpf_obj_drop(kptr) bpf_obj_drop_impl(kptr, NULL)
+#define bpf_rbtree_add(head, node, less) bpf_rbtree_add_impl(head, node, less, NULL, 0) // last two args are always (NULL, 0)
+#define private(name) SEC(".data." #name) __hidden __attribute__((aligned(8)))
+#define __contains(name, node) __attribute__((btf_decl_tag("contains:" #name ":" #node)))
+
 // Define a shared Dispatch Queue (DSQ) ID
 #define SHARED_DSQ_ID 0
 
@@ -20,6 +26,34 @@ struct {
     __type(value, u64); // Virtual deadline
     __uint(max_entries, 1024);
 } task_deadlines SEC(".maps");
+
+struct node_data {
+    struct bpf_rb_node node;    // Must be first
+    struct task_struct *task;
+    long vd;                    // virtual deadline
+    long ve;                    // virtual eligible time ~ don't the we actually need this variable, may be dynamically computed
+    long min_vd;                // minimum virtual deadline in the subtree
+};
+
+static bool less(struct bpf_rb_node *a, const struct bpf_rb_node *b){
+    struct node_data *node_a; // node A is the node we want to add to tree
+    struct node_data *node_b;
+
+    node_a = container_of(a, struct node_data, node);
+    node_b = container_of(b, struct node_data, node);
+
+    // If this subtree has a min_vd bigger than the new node's vd
+    // update the min_vd, because the new node joins this subtree
+    if(node_b->min_vd > node_a->vd)
+        node_b->min_vd = node_a->vd;
+    
+    return node_a->vd < node_b->vd;
+}
+
+long vtime; // still need to build the logic for updating vtime ~ WIP
+
+private(A) struct bpf_spin_lock glock;
+private(A) struct bpf_rb_root groot __contains(node_data, node);
 
 // returns the a task's virtual deadline
 static __always_inline u64 get_task_deadline(struct task_struct *p) {
@@ -40,36 +74,24 @@ static __always_inline u64 calculate_virtual_deadline(struct task_struct *p) {
     return now + runtime; // Example: deadline = now + runtime
 }
 
-// print the tasks in the shared DSQ, including their PIDs and virtual deadlines
-static __always_inline void print_tasks() {
-    struct task_struct *p = NULL;
-    struct bpf_iter_scx_dsq it__iter; // DSQ iterator
+// Helper function to add a task to the rb tree, given its virtual deadline
+static __always_inline int add_node_to_tree(int vd, struct task_struct *task){
+    struct node_data *n;
 
-    // Initialize the DSQ iterator
-    if (bpf_iter_scx_dsq_new(&it__iter, SHARED_DSQ_ID, 0) < 0) {
-        bpf_iter_scx_dsq_destroy(&it__iter);
-        return;
-    }
+    // Allocate memory for a new node in the RB tree
+    n = bpf_obj_new(typeof(*n));
+    if (!n)
+        return -1;
 
-    // Loop through tasks in the DSQ
-    int i = 1;
-    while ((p = bpf_iter_scx_dsq_next(&it__iter)) != NULL) {
-        u32 pid;
-        u64 *deadline;
+    n->vd = vd;
+    n->min_vd = vd;
+    n->task = task;
 
-        // Copy the PID from the task_struct to a local variable
-        bpf_core_read(&pid, sizeof(pid), &p->pid);
+    bpf_spin_lock(&glock);
+    bpf_rbtree_add(&groot, &n->node, less);
+    bpf_spin_unlock(&glock);
 
-        // Get the virtual deadline from the BPF map
-        deadline = bpf_map_lookup_elem(&task_deadlines, &pid);
-        if (deadline) {
-            bpf_printk("%d. Task: %d, vdeadline: %llu\n", i++, pid, *deadline);
-        } else {
-            bpf_printk("%d. Task: %d, no deadline found\n", i++, pid);
-        }
-    }
-
-    bpf_iter_scx_dsq_destroy(&it__iter); // Destroy the DSQ iterator
+    return 0;
 }
 
 // Initialize the scheduler by creating a shared dispatch queue (DSQ)
@@ -88,13 +110,14 @@ int BPF_STRUCT_OPS(sched_enqueue, struct task_struct *p, u64 enq_flags) {
     // Calculate a time slice for the task
     u64 time_slice = 5000000; // fixed time slice of 5ms (in nanoseconds)
 
-    // Enqueue the task with its virtual deadline
+    // Enqueue the task with its virtual deadline to the dsq ~ idk if we still need it after introducing rb trees
     scx_bpf_dsq_insert_vtime(p, SHARED_DSQ_ID, time_slice, deadline, enq_flags);
-    return 0;
+
+    return add_node_to_tree(deadline, p);
 }
 
 // Check if a task is eligible for dispatch
-static __always_inline bool is_task_eligible(struct task_struct *p, s32 cpu) {
+static __always_inline bool is_task_allowed(struct task_struct *p, s32 cpu) {
     // Skip tasks that are not in TASK_RUNNING state
     if (p->__state != 0) {
         bpf_printk("Skipping task %d: not in TASK_RUNNING state (state=%ld)\n", p->pid, p->__state);
@@ -123,10 +146,10 @@ static __always_inline bool is_task_eligible(struct task_struct *p, s32 cpu) {
 }
 
 /**
- * Dispatch a task from the user-defined global DSQ (user-defined as a priority queue on vdeadline) to the local cpu
+ * Dispatch a task from the user-defined global DSQ (user-defined as a priority queue on vd) to the local cpu
  * Returns 1 if successful, 0 if no task was dispatched, negative error codes on failure
  */
-int BPF_STRUCT_OPS(sched_dispatch, s32 cpu, struct task_struct *prev) {
+int BPF_STRUCT_OPS(sched_dispatch_dsq, s32 cpu, struct task_struct *prev) {
     struct bpf_iter_scx_dsq it__iter; // DSQ iterator
     struct task_struct *p = NULL;     // Pointer to the task being dispatched
     int dispatched;                   // return value
@@ -140,8 +163,8 @@ int BPF_STRUCT_OPS(sched_dispatch, s32 cpu, struct task_struct *prev) {
     // Loop to find a task to dispatch
     while ((p = bpf_iter_scx_dsq_next(&it__iter))) {
 
-        // Skip to the next task if not eligible
-        if(!is_task_eligible(p, cpu)) continue;
+        // Skip to the next task if this cannot run on this cpu
+        if(!is_task_allowed(p, cpu)) continue;
 
         // Attempt to move the task
         if ((dispatched = scx_bpf_dsq_move(&it__iter, p, SCX_DSQ_LOCAL, 0))) {
@@ -156,11 +179,44 @@ out:
     return dispatched; // No task was dispatched
 }
 
+/*
+ * Architectures might want to move the poison pointer offset
+ * into some well-recognized area such as 0xdead000000000000,
+ * that is also not mappable by user-space exploits:
+ */
+#ifdef CONFIG_ILLEGAL_POINTER_VALUE
+# define POISON_POINTER_DELTA _AC(CONFIG_ILLEGAL_POINTER_VALUE, UL)
+#else
+# define POISON_POINTER_DELTA 0
+#endif
+#define BPF_PTR_POISON ((void *)(0xeB9FUL + POISON_POINTER_DELTA)) // idfk
+
+/**
+ * Travels down the tree, leaving nodes with an expired vd on the left of the path
+ */
+static int rbtree_split(){
+	struct rb_node **link = &((struct rb_root_cached *)&groot)->rb_root.rb_node;
+	struct rb_node *parent = NULL;
+
+	while (*link) {
+		parent = *link;
+        
+        struct node_data *node;
+        node = container_of((struct bpf_rb_node *) parent, struct node_data, node);
+        if (node->vd <= vtime)
+            link = &parent->rb_left;
+		else
+			link = &parent->rb_right;
+	}
+
+	return 0;
+}
+
 // Define the main scheduler operations structure (sched_ops)
 SEC(".struct_ops.link")
 struct sched_ext_ops sched_ops = {
     .enqueue   = (void *)sched_enqueue,
-    .dispatch  = (void *)sched_dispatch,
+    .dispatch  = (void *)sched_dispatch_dsq,
     .init      = (void *)sched_init,
     .flags     = SCX_OPS_ENQ_LAST | SCX_OPS_KEEP_BUILTIN_IDLE,
     .name      = "eevdf_scheduler"
