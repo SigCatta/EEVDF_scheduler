@@ -30,9 +30,9 @@ struct {
 struct node_data {
     struct bpf_rb_node node;    // Must be first
     struct task_struct *task;
-    long vd;                    // virtual deadline
-    long ve;                    // virtual eligible time ~ don't the we actually need this variable, may be dynamically computed
-    long min_vd;                // minimum virtual deadline in the subtree
+    u64 vd;                    // virtual deadline
+    u64 ve;                    // virtual eligible time ~ don't the we actually need this variable, may be dynamically computed
+    u64 min_vd;                // minimum virtual deadline in the subtree
 };
 
 static bool less(struct bpf_rb_node *a, const struct bpf_rb_node *b){
@@ -50,7 +50,8 @@ static bool less(struct bpf_rb_node *a, const struct bpf_rb_node *b){
     return node_a->vd < node_b->vd;
 }
 
-long vtime; // still need to build the logic for updating vtime ~ WIP
+u64 vtime; // virtual time, still need to build the logic for updating ~ WIP
+u64 stime; // service time, should be unique to clients, but we first assume to have 1 client for simplicity
 
 private(A) struct bpf_spin_lock glock;
 private(A) struct bpf_rb_root groot __contains(node_data, node);
@@ -74,8 +75,78 @@ static __always_inline u64 calculate_virtual_deadline(struct task_struct *p) {
     return now + runtime; // Example: deadline = now + runtime
 }
 
+#define MAX_RUNTIME_INCR 4000000UL // max increase is 4ms
+#define MIN_RUNTIME      100000UL  // min allowed runtime = 100us
+
+struct task_service {
+    u64 target_runtime;     // slice given at last iteration 
+    u64 prev_sum_exec;      // total runtime so far
+};
+
+// Define a BPF map to store virtual deadlines for tasks
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, u32); // Task PID
+    __type(value, struct task_service); // service data
+    __uint(max_entries, 1024);
+} task_service_data SEC(".maps");
+
+/**
+ * Estimates the requested runtime of a task using an adaptive service window approach
+ * data about tasks is stored in a map by pid
+ */
+static u64 task_request_estimate(struct task_struct *task) {
+    u32 pid;
+    bpf_core_read(&pid, sizeof(pid), &task->pid);
+
+    // Lookup task entry in the map
+    struct task_service *sd = bpf_map_lookup_elem(&task_service_data, &pid);
+    
+    // Get the last sum of runtimes for the task
+    u64 last_runtime;
+    bpf_core_read(&last_runtime, sizeof(last_runtime), &task->last_sum_exec_runtime);
+
+    // If task is not found, initialize a new entry
+    struct task_service new_sd;
+    if (!sd) {
+        new_sd.target_runtime = 1000000UL; // Start with 1ms
+        new_sd.prev_sum_exec = last_runtime;
+        bpf_map_update_elem(&task_service_data, &pid, &new_sd, BPF_ANY);
+        return new_sd.target_runtime; // Return the initial slice for new tasks
+    }
+    else // Copy to local so we can safely update and write back
+        new_sd = *sd;
+
+    // Calculate percentage of the runtime used (scaled to avoid float)
+    u64 delta = last_runtime - new_sd.prev_sum_exec;
+    u64 current_target = new_sd.target_runtime;
+    u64 perc_used = (delta * 1000) / current_target;
+
+    // Adaptive adjustment
+    if (perc_used < 500) {
+        new_sd.target_runtime = current_target / 2;
+    } else if (perc_used < 750) {
+        new_sd.target_runtime = (current_target * 9) / 10;
+    } else if (perc_used > 900) {
+        u64 incr = current_target > MAX_RUNTIME_INCR ? MAX_RUNTIME_INCR : current_target;
+        new_sd.target_runtime += incr;
+    }
+
+    // Clamp to minimum target_runtime
+    if (new_sd.target_runtime < MIN_RUNTIME)
+        new_sd.target_runtime = MIN_RUNTIME;
+
+    // Update the sum of runtimes
+    new_sd.prev_sum_exec = last_runtime;
+
+    // Update the map with the new values
+    bpf_map_update_elem(&task_service_data, &pid, &new_sd, BPF_ANY);
+
+    return new_sd.target_runtime;
+}
+
 // Helper function to add a task to the rb tree, given its virtual deadline
-static __always_inline int add_node_to_tree(int vd, struct task_struct *task){
+static __always_inline int add_node_to_tree(struct task_struct *task){
     struct node_data *n;
 
     // Allocate memory for a new node in the RB tree
@@ -83,8 +154,13 @@ static __always_inline int add_node_to_tree(int vd, struct task_struct *task){
     if (!n)
         return -1;
 
+    u64 ve = stime; // service time should be divided by client weight, but we assume a single client, active at vtime = 0
+    n->ve = ve;
+    
+    u64 vd = ve + task_request_estimate(task); // again, client weight is 1 since we only assume 1 client with weight 1...
     n->vd = vd;
     n->min_vd = vd;
+    
     n->task = task;
 
     bpf_spin_lock(&glock);
@@ -113,7 +189,7 @@ int BPF_STRUCT_OPS(sched_enqueue, struct task_struct *p, u64 enq_flags) {
     // Enqueue the task with its virtual deadline to the dsq ~ idk if we still need it after introducing rb trees
     scx_bpf_dsq_insert_vtime(p, SHARED_DSQ_ID, time_slice, deadline, enq_flags);
 
-    return add_node_to_tree(deadline, p);
+    return add_node_to_tree(p);
 }
 
 // Check if a task is eligible for dispatch
