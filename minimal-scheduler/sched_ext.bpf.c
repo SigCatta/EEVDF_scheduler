@@ -11,6 +11,7 @@
 
 // Define a shared Dispatch Queue (DSQ) ID
 #define SHARED_DSQ_ID 0
+#define QUANTUMSIZE  1000000 // 1ms in nanoseconds
 
 #define BPF_STRUCT_OPS(name, args...)	\
     SEC("struct_ops/"#name)	BPF_PROG(name, ##args)
@@ -18,6 +19,7 @@
 #define BPF_STRUCT_OPS_SLEEPABLE(name, args...)	\
     SEC("struct_ops.s/"#name)							      \
     BPF_PROG(name, ##args)
+
 
 // Define a BPF map to store virtual deadlines for tasks
 struct {
@@ -47,11 +49,11 @@ static bool less(struct bpf_rb_node *a, const struct bpf_rb_node *b){
     if(node_b->min_vd > node_a->vd)
         node_b->min_vd = node_a->vd;
     
-    return node_a->vd < node_b->vd;
+    return node_a->ve < node_b->ve;
 }
 
-long vtime; // still need to build the logic for updating vtime ~ WIP
-
+long vtime = 0; // still need to build the logic for updating vtime ~ WIP
+int Totweight = 0; // total weight of all requests
 private(A) struct bpf_spin_lock glock;
 private(A) struct bpf_rb_root groot __contains(node_data, node);
 
@@ -74,8 +76,13 @@ static __always_inline u64 calculate_virtual_deadline(struct task_struct *p) {
     return now + runtime; // Example: deadline = now + runtime
 }
 
+// Get current virtual time
+static __always_inline long get_current_vt() {
+    return vtime;
+}
+
 // Helper function to add a task to the rb tree, given its virtual deadline
-static __always_inline int add_node_to_tree(int vd, struct task_struct *task){
+static __always_inline int add_node_to_tree(struct task_struct *task){
     struct node_data *n;
 
     // Allocate memory for a new node in the RB tree
@@ -83,8 +90,10 @@ static __always_inline int add_node_to_tree(int vd, struct task_struct *task){
     if (!n)
         return -1;
 
-    n->vd = vd;
-    n->min_vd = vd;
+    // TODO: add something related to the weight since in theory it would have also - client_lag / Totweights
+    n->ve = get_current_vt();
+    n->vd = n->ve + QUANTUMSIZE;
+    n->min_vd = n->vd;
     n->task = task;
 
     bpf_spin_lock(&glock);
@@ -113,7 +122,7 @@ int BPF_STRUCT_OPS(sched_enqueue, struct task_struct *p, u64 enq_flags) {
     // Enqueue the task with its virtual deadline to the dsq ~ idk if we still need it after introducing rb trees
     scx_bpf_dsq_insert_vtime(p, SHARED_DSQ_ID, time_slice, deadline, enq_flags);
 
-    return add_node_to_tree(deadline, p);
+    return add_node_to_tree(p);
 }
 
 // Check if a task is eligible for dispatch
@@ -148,7 +157,7 @@ static __always_inline bool is_task_allowed(struct task_struct *p, s32 cpu) {
 /**
  * Dispatch a task from the user-defined global DSQ (user-defined as a priority queue on vd) to the local cpu
  * Returns 1 if successful, 0 if no task was dispatched, negative error codes on failure
- */
+
 int BPF_STRUCT_OPS(sched_dispatch_dsq, s32 cpu, struct task_struct *prev) {
     struct bpf_iter_scx_dsq it__iter; // DSQ iterator
     struct task_struct *p = NULL;     // Pointer to the task being dispatched
@@ -177,8 +186,85 @@ int BPF_STRUCT_OPS(sched_dispatch_dsq, s32 cpu, struct task_struct *prev) {
 out:
     bpf_iter_scx_dsq_destroy(&it__iter); // Destroy the DSQ iterator
     return dispatched; // No task was dispatched
+}*/
+
+static __always_inline struct node_data *get_eligible_request(long virtualtime) {
+    struct bpf_rb_node *node = NULL;
+    struct node_data *path_req = NULL, *st_tree = NULL;
+    struct bpf_rb_node *subtree_root = NULL;
+
+    bpf_spin_lock(&glock);
+    node = bpf_rbtree_first(&groot);
+
+    // Prima ricerca: trova il miglior candidato lungo il percorso
+    while (node) {
+        struct node_data *current = container_of(node, struct node_data, node);
+
+        if (current->ve <= virtualtime) {
+            // Aggiorna il miglior candidato lungo il percorso
+            if (!path_req || (path_req->vd > current->vd)) {
+                path_req = current;
+            }
+
+            // Verifica i sottoalberi sinistri per min_vd
+            if (current->node.left) {
+                struct node_data *left = container_of(current->node.left, struct node_data, node);
+                if (!st_tree || (st_tree->min_vd > left->min_vd)) {
+                    st_tree = left;
+                    subtree_root = current->node.left;
+                }
+            }
+            node = current->node.right;
+        } else {
+            node = current->node.left;
+        }
+    }
+
+    // Controlla se il miglior candidato è lungo il percorso
+    if (!st_tree || (st_tree->min_vd >= path_req->vd)) {
+        bpf_spin_unlock(&glock);
+        return path_req;
+    }
+
+    // Seconda ricerca: esplora il sottoalbero promettente
+    for (node = subtree_root; node; ) {
+        struct node_data *current = container_of(node, struct node_data, node);
+
+        if (current->vd == st_tree->min_vd) {
+            bpf_spin_unlock(&glock);
+            return current;
+        }
+
+        if (current->node.left) {
+            struct node_data *left = container_of(current->node.left, struct node_data, node);
+            if (left->min_vd == st_tree->min_vd) {
+                node = current->node.left;
+                continue;
+            }
+        }
+        node = current->node.right;
+    }
+
+    bpf_spin_unlock(&glock);
+    return NULL;
 }
 
+int BPF_STRUCT_OPS(sched_dispatch_dsq, s32 cpu, struct task_struct *prev){
+    struct node_data *next = get_eligible_request(get_current_vt());
+    if (!next) return 0;
+
+    u64 runtime = QUANTUMSIZE; // O runtime effettivo
+    VirtualTime += runtime ;
+
+    // Rimuovi e reinserta con nuovi ve/vd
+    bpf_rbtree_remove(&groot, &next->node);
+    next->ve += runtime ;
+    next->vd = next->ve + QUANTUMSIZE;
+    bpf_rbtree_add(&groot, &next->node, less);
+
+    scx_bpf_dispatch(next->task, SHARED_DSQ_ID, runtime, 0);
+    return 0;
+}
 /*
  * Architectures might want to move the poison pointer offset
  * into some well-recognized area such as 0xdead000000000000,
