@@ -189,60 +189,81 @@ out:
 }*/
 
 static __always_inline struct node_data *get_eligible_request(long virtualtime) {
-    struct bpf_rb_node *node = NULL;
-    struct node_data *path_req = NULL, *st_tree = NULL;
-    struct bpf_rb_node *subtree_root = NULL;
+    struct node_data *path_req = NULL; // node with earliest deadline along path 
+    struct node_data *st_tree = NULL; // subtree root (along path) with smaller deadline
+    struct rb_node **subtree_root = NULL;
+
+    struct rb_node **node = &((struct rb_root_cached *)&groot)->rb_root.rb_node;
+	struct rb_node *parent = NULL;
 
     bpf_spin_lock(&glock);
-    node = bpf_rbtree_first(&groot);
 
     // Prima ricerca: trova il miglior candidato lungo il percorso
-    while (node) {
-        struct node_data *current = container_of(node, struct node_data, node);
-
-        if (current->ve <= virtualtime) {
-            // Aggiorna il miglior candidato lungo il percorso
-            if (!path_req || (path_req->vd > current->vd)) {
-                path_req = current;
+    while (*node) {
+        parent = *node;
+        
+        // compare eligible time
+        struct node_data *curr;
+        curr = container_of((struct bpf_rb_node *) parent, struct node_data, node);
+        if (curr->ve <= virtualtime) {
+            
+            /** Update node with earliest deadline along path
+             * 
+             * if we don't have a "best" request yet
+             * or if the current best is worse than the current node
+             */
+            if (!path_req || (path_req->vd > curr->vd)) {
+                path_req = curr;
             }
 
-            // Verifica i sottoalberi sinistri per min_vd
-            if (current->node.left) {
-                struct node_data *left = container_of(current->node.left, struct node_data, node);
+            /** Update root of subtree containing earliest deadline 
+             * 
+             * if we don't have an "earliest" yet ~ first iteration
+             * or the left subtree has an earlier deadline
+             */
+            if (parent->rb_left) {
+                struct node_data *left = container_of(&parent->rb_left, struct node_data, node);
                 if (!st_tree || (st_tree->min_vd > left->min_vd)) {
                     st_tree = left;
-                    subtree_root = current->node.left;
+                    subtree_root = &parent->rb_left;
                 }
             }
-            node = current->node.right;
+
+            // if the current node is eligble all nodes on the left are, so we go right
+            node = &parent->rb_right;
         } else {
-            node = current->node.left;
+            // if the current node is not eligible, look at the left subtree
+            node = &parent->rb_left;
         }
     }
 
-    // Controlla se il miglior candidato è lungo il percorso
+    // Check if the node with earliest deadline was along path
     if (!st_tree || (st_tree->min_vd >= path_req->vd)) {
         bpf_spin_unlock(&glock);
         return path_req;
     }
 
-    // Seconda ricerca: esplora il sottoalbero promettente
-    for (node = subtree_root; node; ) {
-        struct node_data *current = container_of(node, struct node_data, node);
+    parent = NULL;
+    // Return node with earliest deadline from subtree
+    for (node = subtree_root; *node; ) {
+        struct node_data *curr;
+        curr = container_of(node, struct node_data, node);
 
-        if (current->vd == st_tree->min_vd) {
+        parent = *node;
+
+        if (curr->vd == st_tree->min_vd) {
             bpf_spin_unlock(&glock);
-            return current;
+            return curr;
         }
 
-        if (current->node.left) {
-            struct node_data *left = container_of(current->node.left, struct node_data, node);
+        if (parent->rb_left) {
+            struct node_data *left = container_of(&parent->rb_left, struct node_data, node);
             if (left->min_vd == st_tree->min_vd) {
-                node = current->node.left;
+                node = &parent->rb_left;
                 continue;
             }
         }
-        node = current->node.right;
+        node = &parent->rb_right;
     }
 
     bpf_spin_unlock(&glock);
@@ -254,7 +275,7 @@ int BPF_STRUCT_OPS(sched_dispatch_dsq, s32 cpu, struct task_struct *prev){
     if (!next) return 0;
 
     u64 runtime = QUANTUMSIZE; // O runtime effettivo
-    VirtualTime += runtime ;
+    vtime += runtime ;
 
     // Rimuovi e reinserta con nuovi ve/vd
     bpf_rbtree_remove(&groot, &next->node);
@@ -289,7 +310,7 @@ static int rbtree_split(){
         
         struct node_data *node;
         node = container_of((struct bpf_rb_node *) parent, struct node_data, node);
-        if (node->vd <= vtime)
+        if (node->ve <= vtime)
             link = &parent->rb_left;
 		else
 			link = &parent->rb_right;
