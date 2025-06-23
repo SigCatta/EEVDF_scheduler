@@ -189,10 +189,11 @@ out:
 }*/
 
 static __always_inline struct node_data *get_eligible_request(long virtualtime) {
-    struct node_data *path_req = NULL; // node with earliest deadline along path 
-    struct node_data *st_tree = NULL; // subtree root (along path) with smaller deadline
-    struct rb_node **subtree_root = NULL;
+    struct node_data *path_req = NULL; // node with earliest deadline along path ~ just data, needed for comparison
+    struct node_data *st_tree = NULL; // subtree root (along path) with smaller deadline ~ just data, needed for comparison
+    struct rb_node **subtree_root = NULL; // subtree root (along path) with smaller deadline ~ has to be rb_node** to travel
 
+    // variables used to travel down the tree
     struct rb_node **node = &((struct rb_root_cached *)&groot)->rb_root.rb_node;
 	struct rb_node *parent = NULL;
 
@@ -251,11 +252,16 @@ static __always_inline struct node_data *get_eligible_request(long virtualtime) 
 
         parent = *node;
 
+        // If the current node is the one with minimum vd, return it
         if (curr->vd == st_tree->min_vd) {
             bpf_spin_unlock(&glock);
             return curr;
         }
 
+        /** Check which child contains the node with minimum vd
+         * 
+         * If the node one the left has the same min_vd as the parent, go left
+         */
         if (parent->rb_left) {
             struct node_data *left = container_of(&parent->rb_left, struct node_data, node);
             if (left->min_vd == st_tree->min_vd) {
@@ -263,6 +269,11 @@ static __always_inline struct node_data *get_eligible_request(long virtualtime) 
                 continue;
             }
         }
+
+        /** If the node on the left either:
+         * does not exist OR has a min_vd higher than that of the parent,
+         * go right
+         */
         node = &parent->rb_right;
     }
 
@@ -270,22 +281,6 @@ static __always_inline struct node_data *get_eligible_request(long virtualtime) 
     return NULL;
 }
 
-int BPF_STRUCT_OPS(sched_dispatch_dsq, s32 cpu, struct task_struct *prev){
-    struct node_data *next = get_eligible_request(get_current_vt());
-    if (!next) return 0;
-
-    u64 runtime = QUANTUMSIZE; // O runtime effettivo
-    vtime += runtime ;
-
-    // Rimuovi e reinserta con nuovi ve/vd
-    bpf_rbtree_remove(&groot, &next->node);
-    next->ve += runtime ;
-    next->vd = next->ve + QUANTUMSIZE;
-    bpf_rbtree_add(&groot, &next->node, less);
-
-    scx_bpf_dispatch(next->task, SHARED_DSQ_ID, runtime, 0);
-    return 0;
-}
 /*
  * Architectures might want to move the poison pointer offset
  * into some well-recognized area such as 0xdead000000000000,
@@ -298,25 +293,50 @@ int BPF_STRUCT_OPS(sched_dispatch_dsq, s32 cpu, struct task_struct *prev){
 #endif
 #define BPF_PTR_POISON ((void *)(0xeB9FUL + POISON_POINTER_DELTA)) // idfk
 
-/**
- * Travels down the tree, leaving nodes with an expired vd on the left of the path
- */
-static int rbtree_split(){
-	struct rb_node **link = &((struct rb_root_cached *)&groot)->rb_root.rb_node;
+
+/* 
+*
+*   ** THIS TWO FUNCTIONS ARE JUST FOR FINDING OUT THAT NODES CANNOT BE ACCESSED DIRECTLY... **
+*
+*/
+
+static __always_inline int test(struct bpf_rb_root *root,
+                u64 vtime,
+			    void *less)
+{
+	struct rb_node **link = &((struct rb_root_cached *)root)->rb_root.rb_node;
 	struct rb_node *parent = NULL;
+	bool leftmost = true;
 
 	while (*link) {
 		parent = *link;
-        
-        struct node_data *node;
-        node = container_of((struct bpf_rb_node *) parent, struct node_data, node);
-        if (node->ve <= vtime)
-            link = &parent->rb_left;
-		else
+		if (vtime > 0) {
+			link = &parent->rb_left;
+		} else {
 			link = &parent->rb_right;
+			leftmost = false;
+		}
 	}
 
 	return 0;
+}
+
+int BPF_STRUCT_OPS(sched_dispatch_dsq, s32 cpu, struct task_struct *prev){
+    // test(&groot, 1, less);
+    // struct node_data *next = get_eligible_request(get_current_vt());
+    // if (!next) return 0;
+
+    u64 runtime = QUANTUMSIZE; // O runtime effettivo
+    vtime += runtime;
+
+    // Rimuovi e reinserta con nuovi ve/vd
+    // bpf_rbtree_remove(&groot, &next->node);
+    // next->ve += runtime ;
+    // next->vd = next->ve + QUANTUMSIZE;
+    // bpf_rbtree_add(&groot, &next->node, less);
+
+    // scx_bpf_dispatch(next->task, SHARED_DSQ_ID, runtime, 0);
+    return 0;
 }
 
 // Define the main scheduler operations structure (sched_ops)
