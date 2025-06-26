@@ -3,12 +3,6 @@
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
 
-#define bpf_obj_new(type) ((type *)bpf_obj_new_impl(bpf_core_type_id_local(type), NULL))
-#define bpf_obj_drop(kptr) bpf_obj_drop_impl(kptr, NULL)
-#define bpf_rbtree_add(head, node, less) bpf_rbtree_add_impl(head, node, less, NULL, 0) // last two args are always (NULL, 0)
-#define private(name) SEC(".data." #name) __hidden __attribute__((aligned(8)))
-#define __contains(name, node) __attribute__((btf_decl_tag("contains:" #name ":" #node)))
-
 // Define a shared Dispatch Queue (DSQ) ID
 #define SHARED_DSQ_ID 0
 
@@ -27,33 +21,8 @@ struct {
     __uint(max_entries, 1024);
 } task_deadlines SEC(".maps");
 
-struct node_data {
-    struct bpf_rb_node node;    // Must be first
-    struct task_struct *task;
-    long vd;                    // virtual deadline
-    long ve;                    // virtual eligible time ~ don't the we actually need this variable, may be dynamically computed
-    long min_vd;                // minimum virtual deadline in the subtree
-};
-
-static bool less(struct bpf_rb_node *a, const struct bpf_rb_node *b){
-    struct node_data *node_a; // node A is the node we want to add to tree
-    struct node_data *node_b;
-
-    node_a = container_of(a, struct node_data, node);
-    node_b = container_of(b, struct node_data, node);
-
-    // If this subtree has a min_vd bigger than the new node's vd
-    // update the min_vd, because the new node joins this subtree
-    if(node_b->min_vd > node_a->vd)
-        node_b->min_vd = node_a->vd;
-    
-    return node_a->vd < node_b->vd;
-}
-
 long vtime; // still need to build the logic for updating vtime ~ WIP
-
-private(A) struct bpf_spin_lock glock;
-private(A) struct bpf_rb_root groot __contains(node_data, node);
+long QUANTUMSIZE = 6000000; // default quantum size of 6 ms
 
 // returns the a task's virtual deadline
 static __always_inline u64 get_task_deadline(struct task_struct *p) {
@@ -74,26 +43,6 @@ static __always_inline u64 calculate_virtual_deadline(struct task_struct *p) {
     return now + runtime; // Example: deadline = now + runtime
 }
 
-// Helper function to add a task to the rb tree, given its virtual deadline
-static __always_inline int add_node_to_tree(int vd, struct task_struct *task){
-    struct node_data *n;
-
-    // Allocate memory for a new node in the RB tree
-    n = bpf_obj_new(typeof(*n));
-    if (!n)
-        return -1;
-
-    n->vd = vd;
-    n->min_vd = vd;
-    n->task = task;
-
-    bpf_spin_lock(&glock);
-    bpf_rbtree_add(&groot, &n->node, less);
-    bpf_spin_unlock(&glock);
-
-    return 0;
-}
-
 // Initialize the scheduler by creating a shared dispatch queue (DSQ)
 s32 BPF_STRUCT_OPS_SLEEPABLE(sched_init) {
     return scx_bpf_create_dsq(SHARED_DSQ_ID, -1);
@@ -107,13 +56,10 @@ int BPF_STRUCT_OPS(sched_enqueue, struct task_struct *p, u64 enq_flags) {
     // Store the virtual deadline in the BPF map
     bpf_map_update_elem(&task_deadlines, &pid, &deadline, BPF_ANY);
     
-    // Calculate a time slice for the task
-    u64 time_slice = 5000000; // fixed time slice of 5ms (in nanoseconds)
+    // Enqueue the task with its virtual deadline to the dsq
+    scx_bpf_dsq_insert_vtime(p, SHARED_DSQ_ID, QUANTUMSIZE, deadline, enq_flags);
 
-    // Enqueue the task with its virtual deadline to the dsq ~ idk if we still need it after introducing rb trees
-    scx_bpf_dsq_insert_vtime(p, SHARED_DSQ_ID, time_slice, deadline, enq_flags);
-
-    return add_node_to_tree(deadline, p);
+    return 0;
 }
 
 // Check if a task is eligible for dispatch
@@ -191,26 +137,6 @@ out:
 #endif
 #define BPF_PTR_POISON ((void *)(0xeB9FUL + POISON_POINTER_DELTA)) // idfk
 
-/**
- * Travels down the tree, leaving nodes with an expired vd on the left of the path
- */
-static int rbtree_split(){
-	struct rb_node **link = &((struct rb_root_cached *)&groot)->rb_root.rb_node;
-	struct rb_node *parent = NULL;
-
-	while (*link) {
-		parent = *link;
-        
-        struct node_data *node;
-        node = container_of((struct bpf_rb_node *) parent, struct node_data, node);
-        if (node->vd <= vtime)
-            link = &parent->rb_left;
-		else
-			link = &parent->rb_right;
-	}
-
-	return 0;
-}
 
 // Define the main scheduler operations structure (sched_ops)
 SEC(".struct_ops.link")
