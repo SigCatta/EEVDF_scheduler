@@ -33,29 +33,40 @@ struct node_data {
     struct bpf_rb_node node;    // Must be first
     struct task_struct *task;
     long vd;                    // virtual deadline
-    long ve;                    // virtual eligible time ~ don't the we actually need this variable, may be dynamically computed
-    long min_vd;                // minimum virtual deadline in the subtree
+    long ve;                    // virtual eligible time ~ don't think we actually need this variable, may be dynamically computed
 };
 
-static bool less(struct bpf_rb_node *a, const struct bpf_rb_node *b){
+static bool less_vd(struct bpf_rb_node *a, const struct bpf_rb_node *b){
     struct node_data *node_a; // node A is the node we want to add to tree
     struct node_data *node_b;
 
     node_a = container_of(a, struct node_data, node);
     node_b = container_of(b, struct node_data, node);
+   
+    return node_a->vd < node_b->vd;
+}
 
-    // If this subtree has a min_vd bigger than the new node's vd
-    // update the min_vd, because the new node joins this subtree
-    if(node_b->min_vd > node_a->vd)
-        node_b->min_vd = node_a->vd;
-    
+static bool less_ve(struct bpf_rb_node *a, const struct bpf_rb_node *b){
+    struct node_data *node_a; // node A is the node we want to add to tree
+    struct node_data *node_b;
+
+    node_a = container_of(a, struct node_data, node);
+    node_b = container_of(b, struct node_data, node);
+ 
     return node_a->ve < node_b->ve;
 }
 
 long vtime = 0; // still need to build the logic for updating vtime ~ WIP
 int Totweight = 0; // total weight of all requests
+
+/** LOCK FOR BOTH TREES ~ have to use one because the BPF verifier complains... **/
 private(A) struct bpf_spin_lock glock;
-private(A) struct bpf_rb_root groot __contains(node_data, node);
+
+/** TREE ORDERED BY VE ~ used to store non-eligible tasks **/
+private(A) struct bpf_rb_root groot_ve __contains(node_data, node);
+
+/** TREE ORDERED BY VD ~ used to store eligible tasks **/
+private(A) struct bpf_rb_root groot_vd __contains(node_data, node);
 
 // returns the a task's virtual deadline
 static __always_inline u64 get_task_deadline(struct task_struct *p) {
@@ -82,7 +93,7 @@ static __always_inline long get_current_vt() {
 }
 
 // Helper function to add a task to the rb tree, given its virtual deadline
-static __always_inline int add_node_to_tree(struct task_struct *task){
+static __always_inline int add_node_to_ve_tree(struct task_struct *task){
     struct node_data *n;
 
     // Allocate memory for a new node in the RB tree
@@ -93,13 +104,66 @@ static __always_inline int add_node_to_tree(struct task_struct *task){
     // TODO: add something related to the weight since in theory it would have also - client_lag / Totweights
     n->ve = get_current_vt();
     n->vd = n->ve + QUANTUMSIZE;
-    n->min_vd = n->vd;
     n->task = task;
 
     bpf_spin_lock(&glock);
-    bpf_rbtree_add(&groot, &n->node, less);
+    bpf_rbtree_add(&groot_ve, &n->node, less_ve);
     bpf_spin_unlock(&glock);
 
+    return 0;
+}
+
+// If any tasks became eligible in the ve tree, move them to the vd tree
+static __always_inline int move_eligible_tasks_to_vd_tree(){
+    struct node_data *m;
+    struct bpf_rb_node *res;
+
+    while (true){
+        bpf_spin_lock(&glock);
+        res = bpf_rbtree_first(&groot_ve);
+        if (!res)
+            break;
+        
+        m = container_of(res, struct node_data, node);
+        if(!m)
+            break;
+
+        // Copy node data
+        long ve = m->ve;
+        long vd = m->vd;
+        struct task_struct *p = m->task;
+
+        // Task is eligible! -> move it!
+        if (ve < vtime){
+            // Delete the copied node from the ve tree
+            res = bpf_rbtree_remove(&groot_ve, res);
+            bpf_spin_unlock(&glock);
+
+            // Drop node
+            m = container_of(res, struct node_data, node);
+            if(!m)
+                return 0;
+            bpf_obj_drop(m); 
+
+            /** START: create a copy of the node to move**/
+            struct node_data *n;
+            n = bpf_obj_new(typeof(*n));
+            if(!n)
+                return 0;
+            
+            n->ve = ve;
+            n->vd = vd;
+            n->task = p;
+            /** END: create a copy of the node to move**/
+
+            // Add copy to the vd tree
+            bpf_spin_lock(&glock);
+            bpf_rbtree_add(&groot_vd, &n->node, less_vd);
+            bpf_spin_unlock(&glock);
+        } else break;
+    }
+    
+    bpf_spin_unlock(&glock);
     return 0;
 }
 
@@ -122,32 +186,50 @@ int BPF_STRUCT_OPS(sched_enqueue, struct task_struct *p, u64 enq_flags) {
     // Enqueue the task with its virtual deadline to the dsq ~ idk if we still need it after introducing rb trees
     scx_bpf_dsq_insert_vtime(p, SHARED_DSQ_ID, time_slice, deadline, enq_flags);
 
-    return add_node_to_tree(p);
+    // add node to the non-eligible tasks tree
+    return add_node_to_ve_tree(p);
 }
 
-// Check if a task is eligible for dispatch
+// Check if a task is eligible for dispatch (with respect to task contraints...)
 static __always_inline bool is_task_allowed(struct task_struct *p, s32 cpu) {
+    if(!p){
+        bpf_printk("Invalid pointer");
+        return false;
+    }
+
+    int pid;
+    bpf_core_read(&pid, sizeof(pid), &p->pid);
+
+    long state;
+    bpf_core_read(&state, sizeof(state), &p->__state);
+
     // Skip tasks that are not in TASK_RUNNING state
-    if (p->__state != 0) {
-        bpf_printk("Skipping task %d: not in TASK_RUNNING state (state=%ld)\n", p->pid, p->__state);
+    if (state != 0) {
+        bpf_printk("Skipping task %d: not in TASK_RUNNING state (state=%ld)\n", pid, state);
         return false;
     }
 
     // Skip idle tasks
-    if (p->pid == 0) {
+    if (pid == 0) {
         bpf_printk("Skipping idle task on CPU %d\n", cpu);
         return false;
     }
 
+    int on_cpu;
+    bpf_core_read(&on_cpu, sizeof(on_cpu), &p->on_cpu);
+
     // Check if the task can be moved (on_cpu is basically a lock...)
-    if (p->on_cpu != 0) {
-        bpf_printk("Task %d cannot be moved on CPU %d\n", p->pid, cpu);
+    if (on_cpu != 0) {
+        bpf_printk("Task %d cannot be moved on CPU %d\n", pid, cpu);
         return false;
     }
 
+    unsigned long cpus_mask_bits;
+    bpf_core_read(&cpus_mask_bits, sizeof(cpus_mask_bits), &p->cpus_mask.bits[0]);
+
     // Check if the task's CPU affinity allows it to run on the specified CPU
-    if (!(p->cpus_mask.bits[0] & (1 << cpu))) {
-        bpf_printk("Task %d cannot run on CPU %d due to affinity\n", p->pid, cpu);
+    if (!(cpus_mask_bits & (1 << cpu))) {
+        bpf_printk("Task %d cannot run on CPU %d due to affinity\n", pid, cpu);
         return false;
     }
 
@@ -188,96 +270,65 @@ out:
     return dispatched; // No task was dispatched
 }*/
 
-static __always_inline struct node_data *get_eligible_request(long virtualtime) {
-    struct node_data *path_req = NULL; // node with earliest deadline along path ~ just data, needed for comparison
-    struct node_data *st_tree = NULL; // subtree root (along path) with smaller deadline ~ just data, needed for comparison
-    struct rb_node **subtree_root = NULL; // subtree root (along path) with smaller deadline ~ has to be rb_node** to travel
+// get_first from the vd tree, if it's not expired ~ all tasks in vd tree are eligible anyway...
+static __always_inline struct task_struct *get_eligible_request(long virtualtime, s32 cpu) {
+    struct node_data *m;
+    struct bpf_rb_node *res;
+    struct task_struct *p;
+    long vd;
 
-    // variables used to travel down the tree
-    struct rb_node **node = &((struct rb_root_cached *)&groot)->rb_root.rb_node;
-	struct rb_node *parent = NULL;
+    // Fetch eligible node with the earliest deadline
+    bpf_spin_lock(&glock);
+    res = bpf_rbtree_first(&groot_vd);
+    if (!res)
+        goto err_unlk;
+
+    m = container_of(res, struct node_data, node);
+    if (!m)
+        goto err_unlk;
+
+    // Access all necessary fields
+    p = m->task;            // task_struct pointer
+    vd = m->vd;             // virtual deadline
+
+    bpf_spin_unlock(&glock);
+
+    // If the task cannot run on this cpu, we just return NULL, without removing the node from the tree
+    // ~ has to be done without holding a lock...
+    if (!is_task_allowed(p, cpu))
+        goto err;
 
     bpf_spin_lock(&glock);
 
-    // Prima ricerca: trova il miglior candidato lungo il percorso
-    while (*node) {
-        parent = *node;
-        
-        // compare eligible time
-        struct node_data *curr;
-        curr = container_of((struct bpf_rb_node *) parent, struct node_data, node);
-        if (curr->ve <= virtualtime) {
-            
-            /** Update node with earliest deadline along path
-             * 
-             * if we don't have a "best" request yet
-             * or if the current best is worse than the current node
-             */
-            if (!path_req || (path_req->vd > curr->vd)) {
-                path_req = curr;
-            }
-
-            /** Update root of subtree containing earliest deadline 
-             * 
-             * if we don't have an "earliest" yet ~ first iteration
-             * or the left subtree has an earlier deadline
-             */
-            if (parent->rb_left) {
-                struct node_data *left = container_of(&parent->rb_left, struct node_data, node);
-                if (!st_tree || (st_tree->min_vd > left->min_vd)) {
-                    st_tree = left;
-                    subtree_root = &parent->rb_left;
-                }
-            }
-
-            // if the current node is eligble all nodes on the left are, so we go right
-            node = &parent->rb_right;
-        } else {
-            // if the current node is not eligible, look at the left subtree
-            node = &parent->rb_left;
-        }
-    }
-
-    // Check if the node with earliest deadline was along path
-    if (!st_tree || (st_tree->min_vd >= path_req->vd)) {
-        bpf_spin_unlock(&glock);
-        return path_req;
-    }
-
-    parent = NULL;
-    // Return node with earliest deadline from subtree
-    for (node = subtree_root; *node; ) {
-        struct node_data *curr;
-        curr = container_of(node, struct node_data, node);
-
-        parent = *node;
-
-        // If the current node is the one with minimum vd, return it
-        if (curr->vd == st_tree->min_vd) {
-            bpf_spin_unlock(&glock);
-            return curr;
-        }
-
-        /** Check which child contains the node with minimum vd
-         * 
-         * If the node one the left has the same min_vd as the parent, go left
-         */
-        if (parent->rb_left) {
-            struct node_data *left = container_of(&parent->rb_left, struct node_data, node);
-            if (left->min_vd == st_tree->min_vd) {
-                node = &parent->rb_left;
-                continue;
-            }
-        }
-
-        /** If the node on the left either:
-         * does not exist OR has a min_vd higher than that of the parent,
-         * go right
-         */
-        node = &parent->rb_right;
-    }
+    // Remove the node from the tree
+    // ~ have to re-fetch it because res is not a non-owning reference
+    struct bpf_rb_node *ref = bpf_rbtree_first(&groot_vd);
+    if (ref == res) // ensure consistency
+        ref = bpf_rbtree_remove(&groot_vd, ref);
+    else
+        goto err_unlk;
 
     bpf_spin_unlock(&glock);
+
+    if (!ref)
+        goto err;
+
+    // Get task pointer, to drop the node
+    m = container_of(ref, struct node_data, node);
+    if (!m)
+        goto err;
+    bpf_obj_drop(m);
+
+    // Ensure the task is not expired. If it is, we can just return NULL since the node has been removed from the tree
+    if (vd < virtualtime)
+        goto err;
+
+    // Return the task_struct pointer
+    return p;
+
+err_unlk:                           // jump here to return after an error, if we hold a lock
+    bpf_spin_unlock(&glock);
+err:                                // jump here to return after an error, if no lock is held
     return NULL;
 }
 
@@ -294,48 +345,23 @@ static __always_inline struct node_data *get_eligible_request(long virtualtime) 
 #define BPF_PTR_POISON ((void *)(0xeB9FUL + POISON_POINTER_DELTA)) // idfk
 
 
-/* 
-*
-*   ** THIS TWO FUNCTIONS ARE JUST FOR FINDING OUT THAT NODES CANNOT BE ACCESSED DIRECTLY... **
-*
-*/
-
-static __always_inline int test(struct bpf_rb_root *root,
-                u64 vtime,
-			    void *less)
-{
-	struct rb_node **link = &((struct rb_root_cached *)root)->rb_root.rb_node;
-	struct rb_node *parent = NULL;
-	bool leftmost = true;
-
-	while (*link) {
-		parent = *link;
-		if (vtime > 0) {
-			link = &parent->rb_left;
-		} else {
-			link = &parent->rb_right;
-			leftmost = false;
-		}
-	}
-
-	return 0;
-}
-
 int BPF_STRUCT_OPS(sched_dispatch_dsq, s32 cpu, struct task_struct *prev){
-    // test(&groot, 1, less);
-    // struct node_data *next = get_eligible_request(get_current_vt());
-    // if (!next) return 0;
+    // check if any tasks became eligible. If so, move them to the vd tree 
+    move_eligible_tasks_to_vd_tree();
+
+    struct task_struct *next = get_eligible_request(get_current_vt(), cpu);
+    if (!next) return 0;
 
     u64 runtime = QUANTUMSIZE; // O runtime effettivo
     vtime += runtime;
 
-    // Rimuovi e reinserta con nuovi ve/vd
-    // bpf_rbtree_remove(&groot, &next->node);
-    // next->ve += runtime ;
-    // next->vd = next->ve + QUANTUMSIZE;
-    // bpf_rbtree_add(&groot, &next->node, less);
+    // Add node to the ve tree ~ it may have become un-eligible...
+    add_node_to_ve_tree(next);
 
-    // scx_bpf_dispatch(next->task, SHARED_DSQ_ID, runtime, 0);
+    // Dispatch the task for execution
+    scx_bpf_dsq_insert(next, SHARED_DSQ_ID, runtime, 0);
+
+    bpf_obj_drop(next);
     return 0;
 }
 
