@@ -7,11 +7,11 @@
 #define VE_DSQ_ID 12345
 #define VD_DSQ_ID 23456
 
-#define BPF_STRUCT_OPS(name, args...)	\
+#define BPF_STRUCT_OPS(name, args...) \
     SEC("struct_ops/"#name)	BPF_PROG(name, ##args)
 
-#define BPF_STRUCT_OPS_SLEEPABLE(name, args...)	\
-    SEC("struct_ops.s/"#name)							      \
+#define BPF_STRUCT_OPS_SLEEPABLE(name, args...) \
+    SEC("struct_ops.s/"#name) \
     BPF_PROG(name, ##args)
 
 // Define a BPF map to store virtual eligible times for tasks
@@ -65,22 +65,27 @@ static __always_inline u64 get_task_ve(struct task_struct *p) {
 // Comptue and update a task's virtual deadline in the bpf map
 static __always_inline void update_virtual_deadline(struct task_struct *p) {
     pid_t pid = p->pid;
-    
-    u64 now = bpf_ktime_get_ns(); // Current time in nanoseconds
-    u64 runtime = p->se.sum_exec_runtime; // Task's runtime
+    u64 ve = get_task_ve(p);
 
-    u64 deadline = now + runtime;
+    u64 vd = ve + QUANTUMSIZE / get_task_vd(p);
 
-    bpf_map_update_elem(&task_vds, &pid, &deadline, BPF_ANY);
+    bpf_map_update_elem(&task_vds, &pid, &vd, BPF_ANY);
 }
 
 // Comptue and update a task's virtual eligible time in the bpf map
-static __always_inline void update_eligible_time(struct task_struct *p){
-    pid_t pid = p->pid;
+static __always_inline void update_virtual_eligible_time(struct task_struct *p){
+    pid_t pid;
+    u64 ve;
 
-    u64 eligible = vtime;
+    bpf_core_read(&pid, sizeof(pid), &p->pid);
 
-    bpf_map_update_elem(&task_ves, &pid, &eligible, BPF_ANY);
+    if(!bpf_map_lookup_elem(&task_ves, &pid)) // if task is new
+        ve = vtime;
+    else
+    // Should actually be ve += used / weight  --  but we cannot wait for the task to end!! So we assume the whole QUANTUM is used
+        ve = get_task_ve(p) + QUANTUMSIZE / get_task_weight(p);
+
+    bpf_map_update_elem(&task_ves, &pid, &ve, BPF_ANY);
 }
 
 /**
@@ -135,9 +140,9 @@ int BPF_STRUCT_OPS(sched_enqueue, struct task_struct *p, u64 enq_flags) {
     // Increa that total tasks weight
     incr_tasks_weight(p);
 
-    // Store the virtual deadline and eligible time in the BPF maps
+    // Store the virtual deadline and eligible time in the BPF maps ~ have to compute VE before VD !!!
+    update_virtual_eligible_time(p);
     update_virtual_deadline(p);
-    update_eligible_time(p);
 
     // Enqueue the task with on the DSQ, ordered by eligible time
     scx_bpf_dsq_insert_vtime(p, VE_DSQ_ID, QUANTUMSIZE, get_task_ve(p), enq_flags);
@@ -199,15 +204,15 @@ static void move_eligible_tasks_to_vd_dsq(s32 cpu){
     // Iterate over the VE DSQ
     while ((p = bpf_iter_scx_dsq_next(&it__iter))) {
         if(is_task_eligible(p)){
-            u64 deadline = get_task_vd(p);
+            u64 vd = get_task_vd(p);
             
             // Override the vtime of the next task that will be moved from it__iter
-            scx_bpf_dsq_move_set_vtime(&it__iter, deadline); 
+            scx_bpf_dsq_move_set_vtime(&it__iter, vd); 
 
             // Finally move the task, with updated vtime
             scx_bpf_dsq_move_vtime(&it__iter, p, VD_DSQ_ID, 0); 
             
-            bpf_printk("Successfully moved task %d to VD_DSQ, vd: %ld\n", p->pid, deadline);
+            bpf_printk("Successfully moved task %d to VD_DSQ, vd: %ld\n", p->pid, vd);
         }
         else break; // Since it's a priority queue, if this task is not eligible, the next aren't either
     }
@@ -239,9 +244,9 @@ static void move_invalid_task_to_ve(struct task_struct *p){
         goto out;
     }
 
-    // Update virtual deadline and eligible time in the BPF maps
+    // Update virtual deadline and eligible time in the BPF maps ~ have to compute VE before VD !!!
+    update_virtual_eligible_time(p);
     update_virtual_deadline(p);
-    update_eligible_time(p);
 
     // Move ask back to VE DSQ
     scx_bpf_dsq_move_set_vtime(&it__iter, get_task_ve(p));
