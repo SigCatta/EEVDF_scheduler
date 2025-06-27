@@ -30,8 +30,9 @@ struct {
     __uint(max_entries, 1024);
 } task_vds SEC(".maps");
 
-long vtime = 0;             // still need to build the logic for updating vtime ~ WIP
-long QUANTUMSIZE = 6000000; // default quantum size of 6 ms
+u64 total_weight = 0;       // Sum of all weights of active tasks
+long vtime = 0;             // Still need to build the logic for updating vtime ~ WIP
+long QUANTUMSIZE = 6000000; // Default quantum size of 6 ms
 
 /** 
  * Returns the a task's virtual deadline
@@ -95,12 +96,44 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(sched_init) {
 }
 
 /**
+ * Weights directly depend on the nice value similarly to standard CFS priority
+ * 
+ * Relative distance between task weights is ~25% (from one nice value to the another)
+ */
+static __always_inline u32 get_task_weight(struct task_struct *p){
+    return p->scx.weight;
+}
+
+/**
+ * Subtract the task's weight from the total
+ */
+static __always_inline void decr_tasks_weight(struct task_struct *p){
+    u32 weight = get_task_weight(p);
+
+    __sync_fetch_and_sub(&total_weight, weight);
+    bpf_printk("Task dequeued, total weight: %d\n", total_weight);
+}
+
+/**
+ * Add the task's weight to the total
+ */
+static __always_inline void incr_tasks_weight(struct task_struct *p){
+    u32 weight = get_task_weight(p);
+
+    __sync_fetch_and_add(&total_weight, weight);
+    bpf_printk("Task enqueued, total weight: %ld\n", total_weight);
+}
+
+/**
  * Enqueue new tasks in the VE DSQ
  * 
  * Virtual deadline and eligible time are also computed and stored in the bpf maps
  */
 int BPF_STRUCT_OPS(sched_enqueue, struct task_struct *p, u64 enq_flags) {
     u32 pid = p->pid;
+
+    // Increa that total tasks weight
+    incr_tasks_weight(p);
 
     // Store the virtual deadline and eligible time in the BPF maps
     update_virtual_deadline(p);
@@ -187,7 +220,7 @@ out:
 /**
  * Check if a task's deadline is expired (i.e., deadline has passed)
  */
-static bool is_task_expired(struct task_struct *p){
+static __always_inline bool is_task_expired(struct task_struct *p){
     return get_task_vd(p) < vtime;
 }
 
@@ -247,6 +280,7 @@ int BPF_STRUCT_OPS(sched_dispatch_dsq, s32 cpu, struct task_struct *prev) {
         // Skip to the next task if this cannot run on this cpu
         if(!is_task_allowed(p, cpu)) continue;
 
+        // Re-schedule task if expired
         if(is_task_expired(p)){
             bpf_printk("Task %d has expired! vd: %ld vt: %ld\n", p->pid, get_task_vd(p), vtime);
             move_invalid_task_to_ve(p);
@@ -256,6 +290,7 @@ int BPF_STRUCT_OPS(sched_dispatch_dsq, s32 cpu, struct task_struct *prev) {
         // Attempt to move the task
         if ((dispatched = scx_bpf_dsq_move(&it__iter, p, SCX_DSQ_LOCAL, 0))) {
             bpf_printk("Successfully dispatched task %d to CPU %d, vd: %ld\n", p->pid, cpu, get_task_vd(p));
+            decr_tasks_weight(p);
             goto out;
         }
         else bpf_printk("Failed to move task %d to CPU %d\n", p->pid, cpu);
