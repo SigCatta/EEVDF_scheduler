@@ -107,12 +107,12 @@ static __always_inline void update_virtual_eligible_time(struct task_struct *p){
 
     bpf_core_read(&pid, sizeof(pid), &p->pid);
 
-    u64 *existing_ve = bpf_map_lookup_elem(&task_ves, &pid);
-    if(!existing_ve) // if task is new
+    // u64 *existing_ve = bpf_map_lookup_elem(&task_ves, &pid);
+    // if(!existing_ve) // if task is new
         ve = get_vtime();
-    else
-    // Should actually be ve += used / weight  --  but we cannot wait for the task to end!! So we assume the whole QUANTUM is used
-        ve = *existing_ve + QUANTUMSIZE / get_task_weight(p);
+    // else
+    // // Should actually be ve += used / weight  --  but we cannot wait for the task to end!! So we assume the whole QUANTUM is used
+    //     ve = *existing_ve + QUANTUMSIZE / get_task_weight(p);
 
     bpf_map_update_elem(&task_ves, &pid, &ve, BPF_ANY);
 }
@@ -153,6 +153,8 @@ static __always_inline void incr_tasks_weight(struct task_struct *p){
  * Virtual deadline and eligible time are also computed and stored in the bpf maps
  */
 s32 BPF_STRUCT_OPS(sched_enqueue, struct task_struct *p, u64 enq_flags) {
+    bpf_printk("Task %d enqueued\n", p->pid);
+
     // Increase the total tasks weight
     incr_tasks_weight(p);
 
@@ -271,20 +273,23 @@ s32 BPF_STRUCT_OPS(sched_dispatch_dsq, s32 cpu, struct task_struct *prev) {
         // Skip to the next task if this cannot run on this cpu
         if(!is_task_allowed(p, cpu)) continue;
 
-        // // Re-schedule task if expired
-        // if(is_task_expired(p)){
-        //     // Update virtual deadline and eligible time in the BPF maps ~ have to compute VE before VD !!!
-        //     update_virtual_eligible_time(p);
-        //     update_virtual_deadline(p);
+        // Re-schedule task if expired
+        if(is_task_expired(p)){
+            bpf_printk("Task %d expired\n", p->pid);
 
-        //     // Move task back to VE DSQ
-        //     scx_bpf_dsq_move_set_vtime(&it__iter, get_task_ve(p));
-        //     scx_bpf_dsq_move_vtime(&it__iter, p, VE_DSQ_ID, 0);
-        //     continue;
-        // }
+            // Update virtual deadline and eligible time in the BPF maps ~ have to compute VE before VD !!!
+            update_virtual_eligible_time(p);
+            update_virtual_deadline(p);
+
+            // Move task back to VE DSQ
+            scx_bpf_dsq_move_set_vtime(&it__iter, get_task_ve(p));
+            scx_bpf_dsq_move_vtime(&it__iter, p, VE_DSQ_ID, 0);
+            continue;
+        }
 
         // Attempt to move the task
         if ((dispatched = scx_bpf_dsq_move(&it__iter, p, SCX_DSQ_LOCAL, 0))) {
+            bpf_printk("Successfully dispatched task %d to CPU %d\n", p->pid, cpu);
             incr_vtime();
             decr_tasks_weight(p);
             goto out;
