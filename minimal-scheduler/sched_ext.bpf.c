@@ -7,6 +7,7 @@
 #define VE_DSQ_ID 12345
 #define VD_DSQ_ID 23456
 
+// Define convenience macros for BPF struct_ops function definitions
 #define BPF_STRUCT_OPS(name, args...) \
     SEC("struct_ops/"#name)	BPF_PROG(name, ##args)
 
@@ -30,12 +31,12 @@ struct {
     __uint(max_entries, 1024);
 } task_vds SEC(".maps");
 
-u64 total_weight = 0;       // Sum of all weights of active tasks
-u64 vtime = 0;             // Still need to build the logic for updating vtime ~ WIP
+u64 total_weight = 0;      // Sum of all weights of active tasks
+u64 vtime = 0;             // Current virtual time
 u64 QUANTUMSIZE = 6000000; // Default quantum size of 6 ms
 
 /** 
- * Returns the a task's virtual deadline
+ * Returns a task's virtual deadline
  */
 static __always_inline u64 get_task_vd(struct task_struct *p) {
     u32 pid;
@@ -45,11 +46,11 @@ static __always_inline u64 get_task_vd(struct task_struct *p) {
 
     // Perform the map lookup
     u64 *vd_ptr = bpf_map_lookup_elem(&task_vds, &pid);
-    return vd_ptr ? *vd_ptr : -1;
+    return vd_ptr ? *vd_ptr : 0; // Return 0 if not found (new task)
 }
 
 /**
- * Returns the a task's virtual eligible time
+ * Returns a task's virtual eligible time
  */
 static __always_inline u64 get_task_ve(struct task_struct *p) {
     u32 pid;
@@ -59,7 +60,7 @@ static __always_inline u64 get_task_ve(struct task_struct *p) {
 
     // Perform the map lookup
     u64 *ve_ptr = bpf_map_lookup_elem(&task_ves, &pid);
-    return ve_ptr ? *ve_ptr : -1;
+    return ve_ptr ? *ve_ptr : 0; // Return 0 if not found (new task)
 }
 
 /**
@@ -79,37 +80,39 @@ static __always_inline u64 get_vtime(){
 }
 
 /**
- * Atomically increments the virtual time by 1 / total_weight
+ * Atomically increments the virtual time by QUANTUMSIZE / total_weight
  * 
  * ~ This function should be called when a task is dispatched
  */
 static __always_inline void incr_vtime(){ 
-    //TODO: have to figure out how much to increment, this seems to work, but the paper uses 1 / total_weight
-    __sync_fetch_and_add(&vtime, QUANTUMSIZE / total_weight);
+    // Avoid division by zero - if no tasks are active, don't increment vtime
+    if (total_weight > 0)
+        __sync_fetch_and_add(&vtime, QUANTUMSIZE / total_weight);
 }
 
-// Comptue and update a task's virtual deadline in the bpf map
+// Compute and update a task's virtual deadline in the bpf map
 static __always_inline void update_virtual_deadline(struct task_struct *p) {
     pid_t pid = p->pid;
     u64 ve = get_task_ve(p);
 
-    u64 vd = ve + QUANTUMSIZE / get_task_vd(p);
+    u64 vd = ve + QUANTUMSIZE / get_task_weight(p);
 
     bpf_map_update_elem(&task_vds, &pid, &vd, BPF_ANY);
 }
 
-// Comptue and update a task's virtual eligible time in the bpf map
+// Compute and update a task's virtual eligible time in the bpf map
 static __always_inline void update_virtual_eligible_time(struct task_struct *p){
     pid_t pid;
     u64 ve;
 
     bpf_core_read(&pid, sizeof(pid), &p->pid);
 
-    if(!bpf_map_lookup_elem(&task_ves, &pid)) // if task is new
+    u64 *existing_ve = bpf_map_lookup_elem(&task_ves, &pid);
+    if(!existing_ve) // if task is new
         ve = get_vtime();
     else
     // Should actually be ve += used / weight  --  but we cannot wait for the task to end!! So we assume the whole QUANTUM is used
-        ve = get_task_ve(p) + QUANTUMSIZE / get_task_weight(p);
+        ve = *existing_ve + QUANTUMSIZE / get_task_weight(p);
 
     bpf_map_update_elem(&task_ves, &pid, &ve, BPF_ANY);
 }
@@ -149,24 +152,22 @@ static __always_inline void incr_tasks_weight(struct task_struct *p){
  * 
  * Virtual deadline and eligible time are also computed and stored in the bpf maps
  */
-int BPF_STRUCT_OPS(sched_enqueue, struct task_struct *p, u64 enq_flags) {
-    u32 pid = p->pid;
-
-    // Increa that total tasks weight
+s32 BPF_STRUCT_OPS(sched_enqueue, struct task_struct *p, u64 enq_flags) {
+    // Increase the total tasks weight
     incr_tasks_weight(p);
 
     // Store the virtual deadline and eligible time in the BPF maps ~ have to compute VE before VD !!!
     update_virtual_eligible_time(p);
     update_virtual_deadline(p);
 
-    // Enqueue the task with on the DSQ, ordered by eligible time
+    // Enqueue the task on the DSQ, ordered by eligible time
     scx_bpf_dsq_insert_vtime(p, VE_DSQ_ID, QUANTUMSIZE, get_task_ve(p), enq_flags);
 
     return 0;
 }
 
 /**
- * Checks if a task is can be dispatched on the current cpu
+ * Checks if a task can be dispatched on the current cpu
  */
 static __always_inline bool is_task_allowed(struct task_struct *p, s32 cpu) {
     // Skip tasks that are not in TASK_RUNNING state
@@ -250,10 +251,10 @@ static __always_inline bool is_task_expired(struct task_struct *p){
  * 
  * Returns 1 if successful, 0 if no task was dispatched, negative error codes on failure
  */
-int BPF_STRUCT_OPS(sched_dispatch_dsq, s32 cpu, struct task_struct *prev) {
+s32 BPF_STRUCT_OPS(sched_dispatch_dsq, s32 cpu, struct task_struct *prev) {
     struct bpf_iter_scx_dsq it__iter; // iterator over the VD DSQ
     struct task_struct *p = NULL;     // Pointer to the task being dispatched
-    int dispatched = 0;               // Return value
+    s32 dispatched = 0;               // Return value
 
     // Check if any tasks became eligible
     move_eligible_tasks_to_vd_dsq(cpu);
@@ -276,7 +277,7 @@ int BPF_STRUCT_OPS(sched_dispatch_dsq, s32 cpu, struct task_struct *prev) {
         //     update_virtual_eligible_time(p);
         //     update_virtual_deadline(p);
 
-        //     // Move ask back to VE DSQ
+        //     // Move task back to VE DSQ
         //     scx_bpf_dsq_move_set_vtime(&it__iter, get_task_ve(p));
         //     scx_bpf_dsq_move_vtime(&it__iter, p, VE_DSQ_ID, 0);
         //     continue;
@@ -295,19 +296,6 @@ out:
     bpf_iter_scx_dsq_destroy(&it__iter); // Destroy the DSQ iterator
     return dispatched;
 }
-
-/*
- * Architectures might want to move the poison pointer offset
- * into some well-recognized area such as 0xdead000000000000,
- * that is also not mappable by user-space exploits:
- */
-#ifdef CONFIG_ILLEGAL_POINTER_VALUE
-# define POISON_POINTER_DELTA _AC(CONFIG_ILLEGAL_POINTER_VALUE, UL)
-#else
-# define POISON_POINTER_DELTA 0
-#endif
-#define BPF_PTR_POISON ((void *)(0xeB9FUL + POISON_POINTER_DELTA)) // idfk
-
 
 // Define the main scheduler operations structure (sched_ops)
 SEC(".struct_ops.link")
