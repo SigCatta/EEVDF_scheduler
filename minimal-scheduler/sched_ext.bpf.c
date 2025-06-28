@@ -35,6 +35,8 @@ u64 total_weight = 0;      // Sum of all weights of active tasks
 u64 vtime = 0;             // Current virtual time
 u64 QUANTUMSIZE = 6000000; // Default quantum size of 6 ms
 
+/***** GETTERS *****/
+
 /** 
  * Returns a task's virtual deadline
  */
@@ -69,7 +71,7 @@ static __always_inline u64 get_task_ve(struct task_struct *p) {
  * Relative distance between task weights is ~25% (from one nice value to the another)
  */
 static __always_inline u32 get_task_weight(struct task_struct *p){
-    return p->scx.weight;
+    return p->scx.weight ? p->scx.weight : 1; // Return 1 if scx.weight == 0 to prevent division by 0
 }
 
 /**
@@ -77,6 +79,26 @@ static __always_inline u32 get_task_weight(struct task_struct *p){
  */
 static __always_inline u64 get_vtime(){
     return vtime;
+}
+
+/***** SHARED STATE *****/
+
+/**
+ * Atomically subtracts the task's weight from the total
+ */
+static __always_inline void decr_tasks_weight(struct task_struct *p){
+    u32 weight = get_task_weight(p);
+
+    __sync_fetch_and_sub(&total_weight, weight);
+}
+
+/**
+ * Atomically adds the task's weight to the total
+ */
+static __always_inline void incr_tasks_weight(struct task_struct *p){
+    u32 weight = get_task_weight(p);
+
+    __sync_fetch_and_add(&total_weight, weight);
 }
 
 /**
@@ -90,7 +112,11 @@ static __always_inline void incr_vtime(){
         __sync_fetch_and_add(&vtime, QUANTUMSIZE / total_weight);
 }
 
-// Compute and update a task's virtual deadline in the bpf map
+/***** HELPERS *****/
+
+/**
+ * Compute and update a task's virtual deadline in the bpf map
+ */
 static __always_inline void update_virtual_deadline(struct task_struct *p) {
     pid_t pid = p->pid;
     u64 ve = get_task_ve(p);
@@ -100,7 +126,9 @@ static __always_inline void update_virtual_deadline(struct task_struct *p) {
     bpf_map_update_elem(&task_vds, &pid, &vd, BPF_ANY);
 }
 
-// Compute and update a task's virtual eligible time in the bpf map
+/**
+ * Compute and update a task's virtual eligible time in the bpf map
+ */
 static __always_inline void update_virtual_eligible_time(struct task_struct *p){
     pid_t pid;
     u64 ve;
@@ -115,57 +143,6 @@ static __always_inline void update_virtual_eligible_time(struct task_struct *p){
     //     ve = *existing_ve + QUANTUMSIZE / get_task_weight(p);
 
     bpf_map_update_elem(&task_ves, &pid, &ve, BPF_ANY);
-}
-
-/**
- * Initialize the scheduler by creating two shared dispatch queues (DSQ) ~ will be used as priority queues
- * 
- * VE_DSQ_ID contains tasks ordered by their virtual eligible time, all tasks here are not eligible
- * VD_DSQ_ID contains tasks ordered by their virtual deadline, all tasks here are eligible
- * 
- * By default, all tasks are put in the VE DSQ. When tasks become eligible, they are moved to the VD DSQ for dispatch
- */
-s32 BPF_STRUCT_OPS_SLEEPABLE(sched_init) {
-    return scx_bpf_create_dsq(VE_DSQ_ID, -1) | scx_bpf_create_dsq(VD_DSQ_ID, -1);
-}
-
-/**
- * Subtract the task's weight from the total
- */
-static __always_inline void decr_tasks_weight(struct task_struct *p){
-    u32 weight = get_task_weight(p);
-
-    __sync_fetch_and_sub(&total_weight, weight);
-}
-
-/**
- * Add the task's weight to the total
- */
-static __always_inline void incr_tasks_weight(struct task_struct *p){
-    u32 weight = get_task_weight(p);
-
-    __sync_fetch_and_add(&total_weight, weight);
-}
-
-/**
- * Enqueue new tasks in the VE DSQ
- * 
- * Virtual deadline and eligible time are also computed and stored in the bpf maps
- */
-s32 BPF_STRUCT_OPS(sched_enqueue, struct task_struct *p, u64 enq_flags) {
-    bpf_printk("Task %d enqueued\n", p->pid);
-
-    // Increase the total tasks weight
-    incr_tasks_weight(p);
-
-    // Store the virtual deadline and eligible time in the BPF maps ~ have to compute VE before VD !!!
-    update_virtual_eligible_time(p);
-    update_virtual_deadline(p);
-
-    // Enqueue the task on the DSQ, ordered by eligible time
-    scx_bpf_dsq_insert_vtime(p, VE_DSQ_ID, QUANTUMSIZE, get_task_ve(p), enq_flags);
-
-    return 0;
 }
 
 /**
@@ -207,6 +184,13 @@ static __always_inline bool is_task_eligible(struct task_struct *p){
 }
 
 /**
+ * Check if a task's deadline is expired (i.e., deadline has passed)
+ */
+static __always_inline bool is_task_expired(struct task_struct *p){
+    return get_task_vd(p) < get_vtime();
+}
+
+/**
  * Iterates over the VE DSQ, checking if any tasks are eligible,
  * all eligible tasks are moved to the VD DSQ
  */
@@ -240,11 +224,39 @@ out:
     return;
 }
 
+/***** SCHED OPS FUNCTIONS *****/
+
 /**
- * Check if a task's deadline is expired (i.e., deadline has passed)
+ * Initialize the scheduler by creating two shared dispatch queues (DSQ) ~ will be used as priority queues
+ * 
+ * VE_DSQ_ID contains tasks ordered by their virtual eligible time, all tasks here are not eligible
+ * VD_DSQ_ID contains tasks ordered by their virtual deadline, all tasks here are eligible
+ * 
+ * By default, all tasks are put in the VE DSQ. When tasks become eligible, they are moved to the VD DSQ for dispatch
  */
-static __always_inline bool is_task_expired(struct task_struct *p){
-    return get_task_vd(p) < get_vtime();
+s32 BPF_STRUCT_OPS_SLEEPABLE(sched_init) {
+    return scx_bpf_create_dsq(VE_DSQ_ID, -1) | scx_bpf_create_dsq(VD_DSQ_ID, -1);
+}
+
+/**
+ * Enqueue new tasks in the VE DSQ
+ * 
+ * Virtual deadline and eligible time are also computed and stored in the bpf maps
+ */
+s32 BPF_STRUCT_OPS(sched_enqueue, struct task_struct *p, u64 enq_flags) {
+    bpf_printk("Task %d enqueued\n", p->pid);
+
+    // Increase the total tasks weight
+    incr_tasks_weight(p);
+
+    // Store the virtual deadline and eligible time in the BPF maps ~ have to compute VE before VD !!!
+    update_virtual_eligible_time(p);
+    update_virtual_deadline(p);
+
+    // Enqueue the task on the DSQ, ordered by eligible time
+    scx_bpf_dsq_insert_vtime(p, VE_DSQ_ID, QUANTUMSIZE, get_task_ve(p), enq_flags);
+
+    return 0;
 }
 
 /**
