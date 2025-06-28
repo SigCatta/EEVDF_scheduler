@@ -31,8 +31,8 @@ struct {
 } task_vds SEC(".maps");
 
 u64 total_weight = 0;       // Sum of all weights of active tasks
-long vtime = 0;             // Still need to build the logic for updating vtime ~ WIP
-long QUANTUMSIZE = 6000000; // Default quantum size of 6 ms
+u64 vtime = 0;             // Still need to build the logic for updating vtime ~ WIP
+u64 QUANTUMSIZE = 6000000; // Default quantum size of 6 ms
 
 /** 
  * Returns the a task's virtual deadline
@@ -62,6 +62,32 @@ static __always_inline u64 get_task_ve(struct task_struct *p) {
     return ve_ptr ? *ve_ptr : -1;
 }
 
+/**
+ * Weights directly depend on the nice value similarly to standard CFS priority
+ * 
+ * Relative distance between task weights is ~25% (from one nice value to the another)
+ */
+static __always_inline u32 get_task_weight(struct task_struct *p){
+    return p->scx.weight;
+}
+
+/**
+ * Returns the current virtual time
+ */
+static __always_inline u64 get_vtime(){
+    return vtime;
+}
+
+/**
+ * Atomically increments the virtual time by 1 / total_weight
+ * 
+ * ~ This function should be called when a task is dispatched
+ */
+static __always_inline void incr_vtime(){ 
+    //TODO: have to figure out how much to increment, this seems to work, but the paper uses 1 / total_weight
+    __sync_fetch_and_add(&vtime, QUANTUMSIZE / total_weight);
+}
+
 // Comptue and update a task's virtual deadline in the bpf map
 static __always_inline void update_virtual_deadline(struct task_struct *p) {
     pid_t pid = p->pid;
@@ -80,7 +106,7 @@ static __always_inline void update_virtual_eligible_time(struct task_struct *p){
     bpf_core_read(&pid, sizeof(pid), &p->pid);
 
     if(!bpf_map_lookup_elem(&task_ves, &pid)) // if task is new
-        ve = vtime;
+        ve = get_vtime();
     else
     // Should actually be ve += used / weight  --  but we cannot wait for the task to end!! So we assume the whole QUANTUM is used
         ve = get_task_ve(p) + QUANTUMSIZE / get_task_weight(p);
@@ -101,22 +127,12 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(sched_init) {
 }
 
 /**
- * Weights directly depend on the nice value similarly to standard CFS priority
- * 
- * Relative distance between task weights is ~25% (from one nice value to the another)
- */
-static __always_inline u32 get_task_weight(struct task_struct *p){
-    return p->scx.weight;
-}
-
-/**
  * Subtract the task's weight from the total
  */
 static __always_inline void decr_tasks_weight(struct task_struct *p){
     u32 weight = get_task_weight(p);
 
     __sync_fetch_and_sub(&total_weight, weight);
-    bpf_printk("Task dequeued, total weight: %d\n", total_weight);
 }
 
 /**
@@ -126,7 +142,6 @@ static __always_inline void incr_tasks_weight(struct task_struct *p){
     u32 weight = get_task_weight(p);
 
     __sync_fetch_and_add(&total_weight, weight);
-    bpf_printk("Task enqueued, total weight: %ld\n", total_weight);
 }
 
 /**
@@ -185,7 +200,7 @@ static __always_inline bool is_task_allowed(struct task_struct *p, s32 cpu) {
  * Checks if the given task is eligible
  */
 static __always_inline bool is_task_eligible(struct task_struct *p){
-    return get_task_ve(p) <= vtime;
+    return get_task_ve(p) <= get_vtime();
 }
 
 /**
@@ -226,37 +241,7 @@ out:
  * Check if a task's deadline is expired (i.e., deadline has passed)
  */
 static __always_inline bool is_task_expired(struct task_struct *p){
-    return get_task_vd(p) < vtime;
-}
-
-/**
- * Move an invalid task from the VD DSQ to the VE DSQ
- * 
- * Vritual deadline and eligible time are also re-computed
- */
-static void move_invalid_task_to_ve(struct task_struct *p){
-    struct bpf_iter_scx_dsq it__iter; // iterator over the VD DSQ
-    pid_t pid = p->pid;               // task pid
-    
-    // Initialize the DSQ iterator
-    if (bpf_iter_scx_dsq_new(&it__iter, VD_DSQ_ID, 0)){
-        bpf_printk("Failed to initialize VD DSQ iterator when re-scheduling task %d\n", pid);  
-        goto out;
-    }
-
-    // Update virtual deadline and eligible time in the BPF maps ~ have to compute VE before VD !!!
-    update_virtual_eligible_time(p);
-    update_virtual_deadline(p);
-
-    // Move ask back to VE DSQ
-    scx_bpf_dsq_move_set_vtime(&it__iter, get_task_ve(p));
-    scx_bpf_dsq_move_vtime(&it__iter, p, VE_DSQ_ID, 0);
-
-    bpf_printk("Re-scheduled task %d due to expired deadline\n", pid);
-
-out:
-    bpf_iter_scx_dsq_destroy(&it__iter); // Destroy the DSQ iterator
-    return;
+    return get_task_vd(p) < get_vtime();
 }
 
 /**
@@ -285,16 +270,21 @@ int BPF_STRUCT_OPS(sched_dispatch_dsq, s32 cpu, struct task_struct *prev) {
         // Skip to the next task if this cannot run on this cpu
         if(!is_task_allowed(p, cpu)) continue;
 
-        // Re-schedule task if expired
-        if(is_task_expired(p)){
-            bpf_printk("Task %d has expired! vd: %ld vt: %ld\n", p->pid, get_task_vd(p), vtime);
-            move_invalid_task_to_ve(p);
-            continue;
-        }
+        // // Re-schedule task if expired
+        // if(is_task_expired(p)){
+        //     // Update virtual deadline and eligible time in the BPF maps ~ have to compute VE before VD !!!
+        //     update_virtual_eligible_time(p);
+        //     update_virtual_deadline(p);
+
+        //     // Move ask back to VE DSQ
+        //     scx_bpf_dsq_move_set_vtime(&it__iter, get_task_ve(p));
+        //     scx_bpf_dsq_move_vtime(&it__iter, p, VE_DSQ_ID, 0);
+        //     continue;
+        // }
 
         // Attempt to move the task
         if ((dispatched = scx_bpf_dsq_move(&it__iter, p, SCX_DSQ_LOCAL, 0))) {
-            bpf_printk("Successfully dispatched task %d to CPU %d, vd: %ld\n", p->pid, cpu, get_task_vd(p));
+            incr_vtime();
             decr_tasks_weight(p);
             goto out;
         }
