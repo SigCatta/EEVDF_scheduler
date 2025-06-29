@@ -239,7 +239,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(sched_init) {
 }
 
 /**
- * Enqueue new tasks in the VE DSQ
+ * Enqueue a new task in the VE DSQ and add its weight to the shared state total variable
  * 
  * Virtual deadline and eligible time are also computed and stored in the bpf maps
  */
@@ -301,9 +301,17 @@ s32 BPF_STRUCT_OPS(sched_dispatch_dsq, s32 cpu, struct task_struct *prev) {
 
         // Attempt to move the task
         if ((dispatched = scx_bpf_dsq_move(&it__iter, p, SCX_DSQ_LOCAL, 0))) {
-            bpf_printk("Successfully dispatched task %d to CPU %d\n", p->pid, cpu);
+            pid_t pid;
+            bpf_core_read(&pid, sizeof(pid), &p->pid);
+
+            bpf_printk("Successfully dispatched task %d to CPU %d\n", pid, cpu);
             incr_vtime();
             decr_tasks_weight(p);
+            
+            // Clean up maps when task is dispatched (no longer enqueued)
+            bpf_map_delete_elem(&task_ves, &pid);
+            bpf_map_delete_elem(&task_vds, &pid);
+            
             goto out;
         }
         else bpf_printk("Failed to move task %d to CPU %d\n", p->pid, cpu);
@@ -314,21 +322,46 @@ out:
     return dispatched;
 }
 
+/**
+ * Exit a previously-running task from the system. p is exiting or the BPF scheduler is being unloaded.
+ * Remove p's data from the ve and vd maps, also decrement the total weight if exited between .enqueue and .dispatch
+ */
+s32 BPF_STRUCT_OPS(sched_exit_task, struct task_struct *p, struct scx_exit_task_args *args) {
+    pid_t pid;
+    bpf_core_read(&pid, sizeof(pid), &p->pid);
+
+    bpf_printk("Task %d exiting\n", pid);
+
+    // Remove VE map entry
+    u64 *existing_ve = bpf_map_lookup_elem(&task_ves, &pid);
+    if(existing_ve)
+        bpf_map_delete_elem(&task_ves, &pid);
+
+    // Remove VD map entry
+    u64 *existing_vd = bpf_map_lookup_elem(&task_vds, &pid);
+    if(existing_vd)
+        bpf_map_delete_elem(&task_vds, &pid);
+
+    // If the task is present in either maps, it was in a DSQ. We have to remove its weight from the total
+    // Note that sched_ext already handles the removal tasks from ALL DSQs to prevent dangling references (also from user-defined DSQs)
+    if(existing_ve || existing_vd)
+        decr_tasks_weight(p);
+
+    return 0;
+}
+
+
 // Define the main scheduler operations structure (sched_ops)
 SEC(".struct_ops.link")
 struct sched_ext_ops sched_ops = {
     .enqueue   = (void *)sched_enqueue,
     .dispatch  = (void *)sched_dispatch_dsq,
     .init      = (void *)sched_init,
-    .flags     = SCX_OPS_ENQ_LAST | SCX_OPS_KEEP_BUILTIN_IDLE,
+    .exit_task = (void *)sched_exit_task,
+    .flags     = SCX_OPS_KEEP_BUILTIN_IDLE // Keep built-in idle tracking
+                | SCX_OPS_ENQ_LAST,        // The last task on a CPU, is not kept there after its slice ~ it's passed to .enqueue instead 
     .name      = "eevdf_scheduler"
 };
-
-// .select_cpu		= (void *)simple_select_cpu,    // probably not needed for us
-// .running			= (void *)simple_running,       // 
-// .stopping		= (void *)simple_stopping,
-// .enable			= (void *)simple_enable,
-// .exit			= (void *)simple_exit,          // probably not needed for us
 
 // License for the BPF program
 char _license[] SEC("license") = "GPL";
