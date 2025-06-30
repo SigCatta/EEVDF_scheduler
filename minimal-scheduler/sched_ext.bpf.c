@@ -7,10 +7,12 @@
 #define VE_DSQ_ID 12345
 #define VD_DSQ_ID 23456
 
+// Define kick throttle timeout (in nanoseconds) - 1ms
+#define KICK_TIMEOUT 1000000ULL
+
 // Define convenience macros for BPF struct_ops function definitions
 #define BPF_STRUCT_OPS(name, args...) \
     SEC("struct_ops/"#name)	BPF_PROG(name, ##args)
-
 #define BPF_STRUCT_OPS_SLEEPABLE(name, args...) \
     SEC("struct_ops.s/"#name) \
     BPF_PROG(name, ##args)
@@ -30,6 +32,14 @@ struct {
     __type(value, u64); // Virtual deadline
     __uint(max_entries, 1024);
 } task_vds SEC(".maps");
+
+// Define a per-CPU array to track last kick time for each CPU
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __type(key, u32); // CPU ID
+    __type(value, u64); // Last kick timestamp
+    __uint(max_entries, 64); // Support up to 64 CPUs
+} cpu_last_kick SEC(".maps");
 
 u64 total_weight = 0;      // Sum of all weights of active tasks
 u64 vtime = 0;             // Current virtual time
@@ -149,15 +159,27 @@ static __always_inline void update_virtual_eligible_time(struct task_struct *p){
  * Checks if a task can be dispatched on the current cpu
  */
 static __always_inline bool is_task_allowed(struct task_struct *p, s32 cpu) {
-    // Skip tasks that are not in TASK_RUNNING state
-    if (p->__state != 0) {
-        bpf_printk("Skipping task %d: not in TASK_RUNNING state (state=%ld)\n", p->pid, p->__state);
-        return false;
-    }
 
-    // Skip idle tasks
-    if (p->pid == 0) {
-        bpf_printk("Skipping idle task on CPU %d\n", cpu);
+    // Check if the task's CPU affinity allows it to run on the specified CPU
+    if (!(p->cpus_mask.bits[0] & (1 << cpu))) {
+        
+        // Kick the first available CPU (simple bit operation)
+        u64 mask = p->cpus_mask.bits[0];
+        if (mask) {
+            s32 target_cpu = __builtin_ctzll(mask);  // Count trailing zeros = first set bit
+            u64 now = bpf_ktime_get_ns();
+            u64* last_kick = bpf_map_lookup_elem(&cpu_last_kick, &target_cpu);
+            
+            // Only kick if we haven't kicked this CPU recently
+            if (!last_kick || (now - *last_kick) > KICK_TIMEOUT) {
+                // Update the last kick timestamp
+                bpf_map_update_elem(&cpu_last_kick, &target_cpu, &now, BPF_ANY);
+                
+                scx_bpf_kick_cpu(target_cpu, 0);
+                bpf_printk("Task %d cannot run here due to affinity, kicking CPU %d\n", p->pid, target_cpu);
+            }
+        }
+
         return false;
     }
 
@@ -167,11 +189,15 @@ static __always_inline bool is_task_allowed(struct task_struct *p, s32 cpu) {
         return false;
     }
 
-    // Check if the task's CPU affinity allows it to run on the specified CPU
-    if (!(p->cpus_mask.bits[0] & (1 << cpu))) {
-        bpf_printk("Task %d cannot run on CPU %d due to affinity\n", p->pid, cpu);
+    // Skip tasks that are not in TASK_RUNNING state
+    if (p->__state != 0) {
+        bpf_printk("Skipping task %d: not in TASK_RUNNING state (state=%ld)\n", p->pid, p->__state);
         return false;
     }
+
+    // Skip idle tasks
+    if (p->pid == 0)
+        return false;
 
     return true; // Task is allowed for dispatch on the current CPU
 }
@@ -198,10 +224,8 @@ static void move_eligible_tasks_to_vd_dsq(s32 cpu){
     struct bpf_iter_scx_dsq it__iter; // iterator over the VE DSQ
     struct task_struct *p = NULL;     // current task_struct
 
-    if (bpf_iter_scx_dsq_new(&it__iter, VE_DSQ_ID, 0)){
-        bpf_printk("Failed to initialize VE DSQ iterator for CPU %d\n", cpu);  
-        goto out;
-    }
+    if (bpf_iter_scx_dsq_new(&it__iter, VE_DSQ_ID, 0))
+        goto out; // Quit if we fail to initialize the iterator
 
     // Iterate over the VE DSQ
     while ((p = bpf_iter_scx_dsq_next(&it__iter))) {
@@ -274,10 +298,8 @@ s32 BPF_STRUCT_OPS(sched_dispatch_dsq, s32 cpu, struct task_struct *prev) {
     move_eligible_tasks_to_vd_dsq(cpu);
 
     // Initialize the DSQ iterator
-    if (bpf_iter_scx_dsq_new(&it__iter, VD_DSQ_ID, 0)){
-        bpf_printk("Failed to initialize VD DSQ iterator for CPU %d\n", cpu);  
-        goto out;
-    }
+    if (bpf_iter_scx_dsq_new(&it__iter, VD_DSQ_ID, 0))
+        goto out; // Quit if we fail to initialize the iterator
 
     // Loop to find a task to dispatch
     while ((p = bpf_iter_scx_dsq_next(&it__iter))) {
