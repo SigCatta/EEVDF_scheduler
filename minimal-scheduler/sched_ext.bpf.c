@@ -145,12 +145,7 @@ static __always_inline void update_virtual_eligible_time(struct task_struct *p){
 
     bpf_core_read(&pid, sizeof(pid), &p->pid);
 
-    // u64 *existing_ve = bpf_map_lookup_elem(&task_ves, &pid);
-    // if(!existing_ve) // if task is new
-        ve = get_vtime();
-    // else
-    // // Should actually be ve += used / weight  --  but we cannot wait for the task to end!! So we assume the whole QUANTUM is used
-    //     ve = *existing_ve + QUANTUMSIZE / get_task_weight(p);
+    ve = get_vtime();
 
     bpf_map_update_elem(&task_ves, &pid, &ve, BPF_ANY);
 }
