@@ -205,13 +205,6 @@ static __always_inline bool is_task_eligible(struct task_struct *p){
 }
 
 /**
- * Check if a task's deadline is expired (i.e., deadline has passed)
- */
-static __always_inline bool is_task_expired(struct task_struct *p){
-    return get_task_vd(p) < get_vtime();
-}
-
-/**
  * Iterates over the VE DSQ, checking if any tasks are eligible,
  * all eligible tasks are moved to the VD DSQ
  */
@@ -301,20 +294,6 @@ s32 BPF_STRUCT_OPS(sched_dispatch_dsq, s32 cpu, struct task_struct *prev) {
 
         // Skip to the next task if this cannot run on this cpu
         if(!is_task_allowed(p, cpu)) continue;
-
-        // Re-schedule task if expired
-        if(is_task_expired(p)){
-            bpf_printk("Task %d expired\n", p->pid);
-
-            // Update virtual deadline and eligible time in the BPF maps ~ have to compute VE before VD !!!
-            update_virtual_eligible_time(p);
-            update_virtual_deadline(p);
-
-            // Move task back to VE DSQ
-            scx_bpf_dsq_move_set_vtime(&it__iter, get_task_ve(p));
-            scx_bpf_dsq_move_vtime(&it__iter, p, VE_DSQ_ID, 0);
-            continue;
-        }
 
         // Attempt to move the task
         if ((dispatched = scx_bpf_dsq_move(&it__iter, p, SCX_DSQ_LOCAL, 0))) {
