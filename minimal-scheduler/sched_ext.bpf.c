@@ -22,16 +22,8 @@ struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, u32); // Task PID
     __type(value, u64); // Eligible time
-    __uint(max_entries, 1024);
+    __uint(max_entries, 16384);
 } task_ves SEC(".maps");
-
-// Define a BPF map to store virtual deadlines for tasks
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __type(key, u32); // Task PID
-    __type(value, u64); // Virtual deadline
-    __uint(max_entries, 1024);
-} task_vds SEC(".maps");
 
 // Define a per-CPU array to track last kick time for each CPU
 struct {
@@ -47,6 +39,16 @@ u64 QUANTUMSIZE = 6000000; // Default quantum size of 6 ms
 
 /***** GETTERS *****/
 
+/**
+ * Weights directly depend on the nice value similarly to standard CFS priority
+ * 
+ * Relative distance between task weights is ~25% (from one nice value to the another)
+ */
+static __always_inline u32 get_task_weight(struct task_struct *p){
+    return p->scx.weight ? p->scx.weight : 1; // Return 1 if scx.weight == 0 to prevent division by 0
+}
+
+
 /** 
  * Returns a task's virtual deadline
  */
@@ -55,10 +57,12 @@ static __always_inline u64 get_task_vd(struct task_struct *p) {
 
     // Copy the PID from the task_struct to a local variable ~ must do because of the BPF verifier
     bpf_core_read(&pid, sizeof(pid), &p->pid);
+    u64 *ve_ptr = bpf_map_lookup_elem(&task_ves, &pid);
 
-    // Perform the map lookup
-    u64 *vd_ptr = bpf_map_lookup_elem(&task_vds, &pid);
-    return vd_ptr ? *vd_ptr : 0; // Return 0 if not found (new task)
+    if(ve_ptr)  // If we have a ve, compute vd on the fly
+        return *ve_ptr + QUANTUMSIZE / get_task_weight(p);
+    else  // Return 0 if not found (new task)
+        return 0;
 }
 
 /**
@@ -73,15 +77,6 @@ static __always_inline u64 get_task_ve(struct task_struct *p) {
     // Perform the map lookup
     u64 *ve_ptr = bpf_map_lookup_elem(&task_ves, &pid);
     return ve_ptr ? *ve_ptr : 0; // Return 0 if not found (new task)
-}
-
-/**
- * Weights directly depend on the nice value similarly to standard CFS priority
- * 
- * Relative distance between task weights is ~25% (from one nice value to the another)
- */
-static __always_inline u32 get_task_weight(struct task_struct *p){
-    return p->scx.weight ? p->scx.weight : 1; // Return 1 if scx.weight == 0 to prevent division by 0
 }
 
 /**
@@ -125,18 +120,6 @@ static __always_inline void incr_vtime(){
 /***** HELPERS *****/
 
 /**
- * Compute and update a task's virtual deadline in the bpf map
- */
-static __always_inline void update_virtual_deadline(struct task_struct *p) {
-    pid_t pid = p->pid;
-    u64 ve = get_task_ve(p);
-
-    u64 vd = ve + QUANTUMSIZE / get_task_weight(p);
-
-    bpf_map_update_elem(&task_vds, &pid, &vd, BPF_ANY);
-}
-
-/**
  * Compute and update a task's virtual eligible time in the bpf map
  */
 static __always_inline void update_virtual_eligible_time(struct task_struct *p){
@@ -145,7 +128,11 @@ static __always_inline void update_virtual_eligible_time(struct task_struct *p){
 
     bpf_core_read(&pid, sizeof(pid), &p->pid);
 
-    ve = get_vtime();
+    u64 *existing_ve = bpf_map_lookup_elem(&task_ves, &pid);
+    if(existing_ve)
+        ve = get_task_ve(p) + QUANTUMSIZE / get_task_weight(p);
+    else
+        ve = get_vtime();
 
     bpf_map_update_elem(&task_ves, &pid, &ve, BPF_ANY);
 }
@@ -263,7 +250,6 @@ s32 BPF_STRUCT_OPS(sched_enqueue, struct task_struct *p, u64 enq_flags) {
 
     // Store the virtual deadline and eligible time in the BPF maps ~ have to compute VE before VD !!!
     update_virtual_eligible_time(p);
-    update_virtual_deadline(p);
 
     // Enqueue the task on the DSQ, ordered by eligible time
     scx_bpf_dsq_insert_vtime(p, VE_DSQ_ID, QUANTUMSIZE, get_task_ve(p), enq_flags);
@@ -304,10 +290,6 @@ s32 BPF_STRUCT_OPS(sched_dispatch_dsq, s32 cpu, struct task_struct *prev) {
             incr_vtime();
             decr_tasks_weight(p);
             
-            // Clean up maps when task is dispatched (no longer enqueued)
-            bpf_map_delete_elem(&task_ves, &pid);
-            bpf_map_delete_elem(&task_vds, &pid);
-            
             goto out;
         }
         else bpf_printk("Failed to move task %d to CPU %d\n", p->pid, cpu);
@@ -330,17 +312,14 @@ s32 BPF_STRUCT_OPS(sched_exit_task, struct task_struct *p, struct scx_exit_task_
 
     // Remove VE map entry
     u64 *existing_ve = bpf_map_lookup_elem(&task_ves, &pid);
-    if(existing_ve)
+    if(existing_ve){
+        bpf_printk("vtime: %ld, vr: %ld, vd: %ld\n", get_vtime(), get_task_ve(p), get_task_vd(p));
         bpf_map_delete_elem(&task_ves, &pid);
-
-    // Remove VD map entry
-    u64 *existing_vd = bpf_map_lookup_elem(&task_vds, &pid);
-    if(existing_vd)
-        bpf_map_delete_elem(&task_vds, &pid);
+    }
 
     // If the task is present in either maps, it was in a DSQ. We have to remove its weight from the total
     // Note that sched_ext already handles the removal tasks from ALL DSQs to prevent dangling references (also from user-defined DSQs)
-    if(existing_ve || existing_vd)
+    if(existing_ve)
         decr_tasks_weight(p);
 
     return 0;
