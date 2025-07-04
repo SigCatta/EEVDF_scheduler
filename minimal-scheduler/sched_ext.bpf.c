@@ -313,7 +313,7 @@ s32 BPF_STRUCT_OPS(sched_exit_task, struct task_struct *p, struct scx_exit_task_
     // Remove VE map entry
     u64 *existing_ve = bpf_map_lookup_elem(&task_ves, &pid);
     if(existing_ve){
-        bpf_printk("vtime: %ld, vr: %ld, vd: %ld\n", get_vtime(), get_task_ve(p), get_task_vd(p));
+        bpf_printk("vtime: %ld, ve: %ld, vd: %ld\n", get_vtime(), get_task_ve(p), get_task_vd(p));
         bpf_map_delete_elem(&task_ves, &pid);
     }
 
